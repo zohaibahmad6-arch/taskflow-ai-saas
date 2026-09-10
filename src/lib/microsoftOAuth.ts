@@ -1,5 +1,6 @@
 import "server-only";
 import { env } from "./env";
+import { fetchWithTimeout, UpstreamTimeoutError } from "./upstreamTimeout";
 
 /**
  * Thin, direct wrapper around the Microsoft identity platform's OAuth 2.0
@@ -19,6 +20,12 @@ import { env } from "./env";
 
 const AUTH_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
 const TOKEN_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+// Bounded wait for the token endpoint. Never retried on timeout/failure by
+// this function or its callers: an authorization-code exchange consumes a
+// single-use code (a retry would just fail with invalid_grant if the first
+// attempt actually landed), and a refresh-token exchange is triggered lazily
+// on the next real request anyway, never looped here.
+const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
 
 /**
  * Delegated Microsoft Graph scopes requested, and why each one is needed.
@@ -80,12 +87,17 @@ export type MicrosoftTokenSet = {
 async function postToken(body: URLSearchParams): Promise<Record<string, unknown>> {
   let res: Response;
   try {
-    res = await fetch(TOKEN_ENDPOINT, {
+    res = await fetchWithTimeout(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
+      timeoutMs: TOKEN_REQUEST_TIMEOUT_MS,
+      serviceName: "Microsoft",
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof UpstreamTimeoutError) {
+      throw new MicrosoftOAuthError("Microsoft's token endpoint took too long to respond.");
+    }
     throw new MicrosoftOAuthError("Could not reach Microsoft's token endpoint (network error).");
   }
 

@@ -1,5 +1,6 @@
 import "server-only";
 import { db, nowIso } from "./db";
+import { isValidIanaTimezone } from "./timezone";
 
 export type PreferencesRow = {
   user_id: string;
@@ -12,6 +13,7 @@ export type PreferencesRow = {
   hashtag_preference: string | null;
   formatting_notes: string | null;
   ai_instructions: string | null;
+  timezone: string | null;
   updated_at: string;
 };
 
@@ -35,10 +37,25 @@ export type PreferencesUpdate = Partial<{
   hashtagPreference: string;
   formattingNotes: string;
   aiInstructions: string;
+  /**
+   * An IANA timezone identifier, or null to clear it back to "not set"
+   * (UTC fallback). MUST already be validated by the caller (see the
+   * /api/preferences route's use of isValidIanaTimezone) — this function
+   * trusts its input, it does not re-validate.
+   */
+  timezone: string | null;
 }>;
 
 export function updatePreferences(userId: string, update: PreferencesUpdate): PreferencesRow {
   getPreferences(userId); // ensure row exists
+
+  // Defense in depth: even though the /api/preferences route already
+  // validates this before calling here, never let a raw, unvalidated
+  // client-controlled timezone string reach the database from any path.
+  if (update.timezone != null && !isValidIanaTimezone(update.timezone)) {
+    throw new Error(`"${update.timezone}" is not a recognized IANA timezone identifier.`);
+  }
+
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -52,6 +69,7 @@ export function updatePreferences(userId: string, update: PreferencesUpdate): Pr
     hashtag_preference: update.hashtagPreference,
     formatting_notes: update.formattingNotes,
     ai_instructions: update.aiInstructions,
+    timezone: update.timezone,
   };
 
   for (const [column, value] of Object.entries(map)) {

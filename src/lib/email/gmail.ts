@@ -7,6 +7,7 @@ import {
   getConnection,
 } from "../connections";
 import { refreshAccessToken, GoogleOAuthError } from "../googleOAuth";
+import { fetchWithTimeout, UpstreamTimeoutError } from "../upstreamTimeout";
 import {
   EmailProvider,
   EmailProviderError,
@@ -20,6 +21,7 @@ const API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const REFRESH_MARGIN_MS = 60_000; // refresh a bit before actual expiry, not right at the deadline
 const MAX_RESULTS_CAP = 50; // data minimization: never pull more than this in one call, regardless of what's asked
 const MAX_BODY_LENGTH = 12_000; // data minimization: cap how much of any one message body we ever hold/pass to the AI
+const REQUEST_TIMEOUT_MS = 15_000; // bounded wait for a single Gmail API call — read-only, safe to time out and report an error
 
 /**
  * Real Gmail implementation of EmailProvider. Every network call goes
@@ -81,8 +83,15 @@ export class GmailProvider implements EmailProvider {
 
     let res: Response;
     try {
-      res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-    } catch {
+      res = await fetchWithTimeout(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        serviceName: "Gmail",
+      });
+    } catch (err) {
+      if (err instanceof UpstreamTimeoutError) {
+        throw new EmailProviderError("Gmail took too long to respond. Try again in a moment.", "network_error");
+      }
       throw new EmailProviderError("Could not reach Gmail (network error).", "network_error");
     }
 
@@ -179,8 +188,15 @@ export class GmailProvider implements EmailProvider {
 export async function verifyGmailAccessToken(accessToken: string): Promise<{ emailAddress: string }> {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}/profile`, { headers: { Authorization: `Bearer ${accessToken}` } });
-  } catch {
+    res = await fetchWithTimeout(`${API_BASE}/profile`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      serviceName: "Gmail",
+    });
+  } catch (err) {
+    if (err instanceof UpstreamTimeoutError) {
+      throw new EmailProviderError("Gmail took too long to respond while verifying the connection.", "network_error");
+    }
     throw new EmailProviderError("Could not reach Gmail to verify the connection (network error).", "network_error");
   }
   if (!res.ok) {

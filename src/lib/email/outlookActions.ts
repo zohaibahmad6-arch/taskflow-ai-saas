@@ -5,6 +5,7 @@ import {
   markConnectionError,
 } from "../connections";
 import { refreshAccessToken, MicrosoftOAuthError } from "../microsoftOAuth";
+import { fetchWithTimeout, UpstreamTimeoutError } from "../upstreamTimeout";
 import { EmailProviderError } from "./provider";
 
 /**
@@ -26,6 +27,14 @@ import { EmailProviderError } from "./provider";
 const API_BASE = "https://graph.microsoft.com/v1.0/me";
 const REFRESH_MARGIN_MS = 60_000;
 const MAX_BATCH = 50; // data minimization / abuse-limit: cap how many messages one approved action can touch
+// Bounded wait for a single Graph mutation call. Deliberately NOT retried
+// anywhere in this file on timeout or any other failure: every call here
+// is a real mailbox mutation (move/delete/send/...), and the first attempt
+// may have already reached Microsoft before the timeout fired — retrying
+// could duplicate the action (e.g. sending a reply twice). A timeout is
+// reported as a failure for that message/action, exactly like any other
+// error, and it is up to the human to decide whether to ask for it again.
+const REQUEST_TIMEOUT_MS = 20_000;
 
 export type BatchOutcome = {
   succeeded: string[];
@@ -75,7 +84,7 @@ async function graphFetch(
   path: string,
   init?: { method?: string; body?: unknown }
 ): Promise<Response> {
-  return fetch(`${API_BASE}${path}`, {
+  return fetchWithTimeout(`${API_BASE}${path}`, {
     method: init?.method ?? "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -83,6 +92,8 @@ async function graphFetch(
       ...(init?.body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    serviceName: "Outlook",
   });
 }
 
@@ -151,8 +162,14 @@ async function runPerMessage(
       } else {
         outcome.failed.push({ messageId, error: await graphErrorMessage(res) });
       }
-    } catch {
-      outcome.failed.push({ messageId, error: "Network error reaching Outlook." });
+    } catch (err) {
+      // Whether this was a timeout or any other network failure, the
+      // outcome is identical and safe: this ONE message is reported
+      // failed, nothing is retried, and the loop moves on to the next
+      // message rather than assuming anything about whether Outlook
+      // actually received the request.
+      const error = err instanceof UpstreamTimeoutError ? "Outlook took too long to respond." : "Network error reaching Outlook.";
+      outcome.failed.push({ messageId, error });
     }
   }
   return outcome;

@@ -7,6 +7,7 @@ import {
   getConnection,
 } from "../connections";
 import { refreshAccessToken, MicrosoftOAuthError } from "../microsoftOAuth";
+import { fetchWithTimeout, UpstreamTimeoutError } from "../upstreamTimeout";
 import {
   EmailProvider,
   EmailProviderError,
@@ -20,6 +21,7 @@ const API_BASE = "https://graph.microsoft.com/v1.0/me";
 const REFRESH_MARGIN_MS = 60_000; // refresh a bit before actual expiry, not right at the deadline
 const MAX_RESULTS_CAP = 50; // data minimization: never pull more than this in one call, regardless of what's asked
 const MAX_BODY_LENGTH = 12_000; // data minimization: cap how much of any one message body we ever hold/pass to the AI
+const REQUEST_TIMEOUT_MS = 15_000; // bounded wait for a single Graph API call — read-only, safe to time out and report an error
 
 const SUMMARY_SELECT = "id,conversationId,subject,from,receivedDateTime,bodyPreview";
 const FULL_SELECT = "id,conversationId,subject,from,toRecipients,receivedDateTime,body,bodyPreview";
@@ -78,10 +80,15 @@ export class OutlookProvider implements EmailProvider {
 
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        serviceName: "Outlook",
       });
-    } catch {
+    } catch (err) {
+      if (err instanceof UpstreamTimeoutError) {
+        throw new EmailProviderError("Outlook took too long to respond. Try again in a moment.", "network_error");
+      }
       throw new EmailProviderError("Could not reach Outlook (network error).", "network_error");
     }
 
@@ -169,10 +176,15 @@ export class OutlookProvider implements EmailProvider {
 export async function verifyOutlookAccessToken(accessToken: string): Promise<{ emailAddress: string }> {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}?$select=mail,userPrincipalName`, {
+    res = await fetchWithTimeout(`${API_BASE}?$select=mail,userPrincipalName`, {
       headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      serviceName: "Outlook",
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof UpstreamTimeoutError) {
+      throw new EmailProviderError("Outlook took too long to respond while verifying the connection.", "network_error");
+    }
     throw new EmailProviderError("Could not reach Outlook to verify the connection (network error).", "network_error");
   }
   if (!res.ok) {

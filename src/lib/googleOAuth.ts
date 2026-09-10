@@ -1,5 +1,6 @@
 import "server-only";
 import { env } from "./env";
+import { fetchWithTimeout, UpstreamTimeoutError } from "./upstreamTimeout";
 
 /**
  * Thin, direct wrapper around Google's OAuth 2.0 + token endpoints (no
@@ -15,6 +16,12 @@ import { env } from "./env";
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke";
+// Bounded wait for Google's token/revoke endpoints. Never retried on
+// timeout/failure: an authorization-code exchange consumes a single-use
+// code, a refresh happens lazily on the next real request, and revoke is
+// already explicitly best-effort/never-throws below.
+const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
+const REVOKE_REQUEST_TIMEOUT_MS = 10_000;
 
 /** Minimum scope for everything this phase needs: read mail, nothing else. No send/modify/delete scope is ever requested. */
 export const GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
@@ -51,12 +58,17 @@ export type GoogleTokenSet = {
 async function postToken(body: URLSearchParams): Promise<Record<string, unknown>> {
   let res: Response;
   try {
-    res = await fetch(TOKEN_ENDPOINT, {
+    res = await fetchWithTimeout(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
+      timeoutMs: TOKEN_REQUEST_TIMEOUT_MS,
+      serviceName: "Google",
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof UpstreamTimeoutError) {
+      throw new GoogleOAuthError("Google's token endpoint took too long to respond.");
+    }
     throw new GoogleOAuthError("Could not reach Google's token endpoint (network error).");
   }
 
@@ -125,10 +137,12 @@ export async function refreshAccessToken(
  */
 export async function revokeGoogleToken(token: string): Promise<boolean> {
   try {
-    const res = await fetch(REVOKE_ENDPOINT, {
+    const res = await fetchWithTimeout(REVOKE_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ token }),
+      timeoutMs: REVOKE_REQUEST_TIMEOUT_MS,
+      serviceName: "Google",
     });
     return res.ok;
   } catch {

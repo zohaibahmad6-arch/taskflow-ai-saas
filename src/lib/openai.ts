@@ -4,10 +4,17 @@ import { env } from "./env";
 
 let client: OpenAI | null = null;
 
+// Bounded wait per OpenAI request. The SDK's own default is 10 minutes —
+// far too long to leave a user-facing request hanging on. Left at the
+// SDK's default retry behavior (safe here: chat/transcription calls are
+// stateless generation, not mailbox mutations, so an automatic retry after
+// a timeout cannot duplicate a real-world external action).
+const REQUEST_TIMEOUT_MS = 30_000;
+
 /** Lazily-constructed server-side OpenAI client. Never import this from client components. */
 export function getOpenAIClient(): OpenAI {
   if (!client) {
-    client = new OpenAI({ apiKey: env.openaiApiKey });
+    client = new OpenAI({ apiKey: env.openaiApiKey, timeout: REQUEST_TIMEOUT_MS });
   }
   return client;
 }

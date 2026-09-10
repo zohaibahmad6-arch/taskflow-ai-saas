@@ -2,6 +2,16 @@ import "server-only";
 import webpush from "web-push";
 import { db, newId } from "./db";
 import { env } from "./env";
+import { withTimeout } from "./upstreamTimeout";
+
+// web-push makes its own HTTPS request internally (not via fetch) and has
+// no timeout option of its own — see upstreamTimeout.ts's withTimeout for
+// why this can only bound the WAIT, not truly abort the socket. Bounded
+// regardless so one slow/unreachable push endpoint can never hold up the
+// Promise.all() below indefinitely. Never retried: a push send is already
+// best-effort (see notifyUser's doc comment) and a duplicate push is
+// exactly the kind of user-visible noise this app tries to avoid.
+const PUSH_SEND_TIMEOUT_MS = 10_000;
 
 let configured = false;
 function ensureConfigured(): boolean {
@@ -111,9 +121,10 @@ export async function notifyUser(
   await Promise.all(
     subs.map(async (sub) => {
       try {
-        await webpush.sendNotification(
-          { endpoint: sub.endpoint, keys: JSON.parse(sub.keys_json) },
-          body
+        await withTimeout(
+          webpush.sendNotification({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys_json) }, body),
+          PUSH_SEND_TIMEOUT_MS,
+          "Web Push"
         );
       } catch (err: unknown) {
         const statusCode = (err as { statusCode?: number })?.statusCode;

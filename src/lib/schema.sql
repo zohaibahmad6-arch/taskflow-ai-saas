@@ -21,6 +21,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
+-- `timezone` is a nullable IANA identifier (e.g. "Europe/London") used
+-- ONLY to compute the Daily Briefing's local calendar date (see
+-- dailyBriefing.ts) — never assumed, never auto-detected server-side, and
+-- never trusted without validation (see src/lib/timezone.ts). NULL means
+-- "not set", and every reader of this column must fall back to UTC in
+-- that case (and for any value that somehow fails validation) rather than
+-- guessing or erroring.
 CREATE TABLE IF NOT EXISTS preferences (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   writing_style TEXT,
@@ -32,6 +39,7 @@ CREATE TABLE IF NOT EXISTS preferences (
   hashtag_preference TEXT,
   formatting_notes TEXT,
   ai_instructions TEXT,
+  timezone TEXT,
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 

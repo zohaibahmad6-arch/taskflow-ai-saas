@@ -71,6 +71,7 @@ function runMigrations(db: Database.Database): void {
     "ALTER TABLE notifications ADD COLUMN reference_id TEXT",
     "ALTER TABLE notifications ADD COLUMN read_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_notifications_user_reference ON notifications(user_id, reference_id)",
+    "ALTER TABLE preferences ADD COLUMN timezone TEXT",
   ];
   for (const sql of migrations) {
     try {

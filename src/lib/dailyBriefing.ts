@@ -7,6 +7,8 @@ import { listJobs, listApplicationsForUser } from "./jobs/store";
 import type { Job, JobApplication } from "./jobs/types";
 import { listApprovals } from "./approvals";
 import { notifyUser } from "./push";
+import { getPreferences } from "./preferences";
+import { resolveTimezone, todayDateInTimezone } from "./timezone";
 
 /**
  * Aggregation service for the Daily Personal Briefing. Nothing in this
@@ -18,13 +20,16 @@ import { notifyUser } from "./push";
  * see the doc comment on generateDailyBriefing below for the exact
  * contract a scheduler would rely on.
  *
- * No per-user timezone preference exists anywhere in this app yet (see
- * schema.sql — preferences has no timezone column), so `briefingDate` is
- * the UTC calendar date. This is called out explicitly rather than
- * silently assumed: a future timezone preference would only need to
- * change how `todayDateUTC()` below computes "today" for a given user —
- * everything downstream (storage, idempotency, dedup) already works off
- * an opaque date string and does not care which timezone produced it.
+ * `briefingDate` is the user's LOCAL calendar date when a valid IANA
+ * timezone preference is set (preferences.timezone — see
+ * src/lib/timezone.ts), and the UTC calendar date otherwise (unset,
+ * cleared, or — impossible via the validated write path, but handled
+ * anyway — somehow invalid). This is computed fresh on every call via
+ * `computeBriefingDate()` below rather than cached, so a user who sets a
+ * timezone for the first time gets its effect on their very next
+ * briefing. Timezone transitions (DST) are handled correctly for free —
+ * `Intl.DateTimeFormat` always reflects the real offset for the instant
+ * being formatted, never a fixed/stale offset.
  *
  * Every section below is built ONLY from what this app has actually
  * fetched/stored — a disconnected provider is reported as disconnected,
@@ -75,8 +80,15 @@ export type DailyBriefing = {
   summaryText: string;
 };
 
-function todayDateUTC(): string {
-  return new Date().toISOString().slice(0, 10);
+/**
+ * Today's calendar date for this user: their local date if they've set a
+ * valid timezone preference, UTC otherwise. Never assumes a timezone that
+ * wasn't explicitly, validly set — see resolveTimezone's UTC fallback.
+ */
+function computeBriefingDate(userId: string): string {
+  const prefs = getPreferences(userId);
+  const timezone = resolveTimezone(prefs.timezone);
+  return todayDateInTimezone(timezone);
 }
 
 const STRONG_MATCH_THRESHOLD = 70;
@@ -101,9 +113,15 @@ async function buildEmailSection(userId: string, providerId: KnownEmailProviderI
     };
   }
 
-  const today = todayDateUTC();
+  // email/briefing.ts's own summaryDate is UTC-based (a separate, existing
+  // system this file only reads from — out of scope to change here), so
+  // the freshness check below deliberately compares against UTC too, not
+  // this user's briefing_date timezone: comparing a UTC-stamped date
+  // against a local-date string would misjudge freshness in either
+  // direction depending on the offset.
+  const todayUTC = new Date().toISOString().slice(0, 10);
   let briefing = getLatestBriefing(userId, providerId);
-  if (!briefing || briefing.summaryDate !== today) {
+  if (!briefing || briefing.summaryDate !== todayUTC) {
     try {
       briefing = await generateAndStoreBriefing(userId, providerId);
     } catch (err) {
@@ -342,7 +360,7 @@ function storeBriefing(briefing: DailyBriefing): void {
  * aggregation logic themselves.
  */
 export async function generateDailyBriefing(userId: string, opts?: { forceRefresh?: boolean }): Promise<DailyBriefing> {
-  const briefingDate = todayDateUTC();
+  const briefingDate = computeBriefingDate(userId);
 
   if (!opts?.forceRefresh) {
     const existing = getStoredBriefing(userId, briefingDate);

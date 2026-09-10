@@ -789,33 +789,41 @@ have outbound network access to `api.openai.com`:
 5. Disconnect, then reconnect → confirm no duplicate `connected_accounts`
    row (schema has `UNIQUE(user_id, provider)`).
 
-### Timezone (current status + smallest safe path forward)
+### Timezone (implemented: preference + local briefing_date; scheduler still not built)
 
-**Current behavior**: `daily_briefings.briefing_date` is the UTC calendar
-date (`new Date().toISOString().slice(0, 10)` in `dailyBriefing.ts`).
-Because generation is on-demand (opening the app, not a midnight cron),
-this only matters right around UTC midnight — a briefing opened at
-11:59pm UTC and again at 12:01am UTC is (correctly) treated as two
-different days, which may not match the user's own local "today" if
-their timezone is far from UTC.
+**Current behavior**: Settings → Account → Timezone lets you set a
+validated IANA timezone (e.g. `Asia/Qatar`), extending the existing
+per-user `preferences` row (`preferences.timezone`, nullable — never a
+second settings table). `daily_briefings.briefing_date` is computed in
+that timezone when it's set (`computeBriefingDate()` in
+`dailyBriefing.ts`, via `todayDateInTimezone()` in `src/lib/timezone.ts`),
+and falls back to the UTC calendar date otherwise — unset, cleared, or
+(defensively handled, though the write path already rejects it) somehow
+invalid. Every write is validated server-side against the real IANA
+database (`isValidIanaTimezone()` constructs an `Intl.DateTimeFormat`
+with it — invalid names throw) both in the `/api/preferences` route and
+again inside `updatePreferences()` itself (defense in depth); client
+input is never trusted directly, and the client's own detected zone
+(`Intl.DateTimeFormat().resolvedOptions().timeZone`) is only ever offered
+as a one-tap suggestion, never auto-saved. `UNIQUE(user_id,
+briefing_date)` idempotency is unaffected — it still just uniques an
+opaque date string, now computed in the right calendar. DST/offset
+transitions are handled correctly for free, since `Intl.DateTimeFormat`
+always reflects the real offset for the instant being formatted.
 
-**Recommended smallest-safe change**, not implemented here (out of
-scope for this phase, and pointless without a scheduler to make use of
-it):
-1. Add one nullable column: `ALTER TABLE preferences ADD COLUMN
-   timezone TEXT` (IANA name, e.g. `"America/New_York"`), via the
-   existing idempotent migration pattern in `db.ts`.
-2. Add a Settings field for the user to set it (or auto-detect via
-   `Intl.DateTimeFormat().resolvedOptions().timeZone` client-side once, on
-   first login, and POST it).
-3. Change exactly one function, `todayDateUTC()` in `dailyBriefing.ts`,
-   to compute "today" in that timezone instead of UTC (e.g. via
-   `Intl.DateTimeFormat` with the `timeZone` option) — everything else
-   (idempotency, dedup, storage) already works off an opaque date string
-   and needs no change.
-4. **Effect on idempotency**: none — `UNIQUE(user_id, briefing_date)`
-   keeps working identically; the date string it uniques on would simply
-   be computed in the user's zone instead of UTC.
+Because generation is still on-demand (opening the app, not a scheduled
+job — see below), this mostly matters right around local midnight: two
+opens of the app three minutes apart, straddling midnight in the user's
+zone, correctly produce the SAME `briefing_date` and upsert one row, not
+two (verified — see `tests/unit/daily-briefing-timezone.test.ts`'s
+midnight-boundary and same-local-day-different-UTC-timestamp cases).
+Migration is additive and idempotent (`ALTER TABLE preferences ADD
+COLUMN timezone TEXT`, in the existing `db.ts` migration list) —
+existing rows get `NULL` and keep working under the UTC fallback with no
+behavior change until a user explicitly sets a timezone.
+
+**Still not implemented, by design**: nothing here makes the scheduler
+itself timezone-aware, because there still isn't one — see below.
 
 ### Scheduler (current status + recommended production architecture)
 
@@ -837,15 +845,50 @@ configured, lets the existing `notifyUser()` dedup logic decide whether
 a notification is actually warranted. Nothing about `dailyBriefing.ts`
 needs to change to support this.
 
-### Known, non-blocking hardening recommendation (not applied this phase)
+### Upstream request timeouts (implemented)
 
-`src/lib/email/gmail.ts` and `outlook.ts`'s `fetch()` calls (and the
-OpenAI SDK's own calls) have no explicit request timeout/`AbortController`
-— an unresponsive upstream could hold a request open longer than ideal.
-Not fixed in this phase (touches multiple files with no existing test
-coverage for timeout behavior, and the master prompt for this phase asked
-for genuine defects to be fixed, not speculative hardening); flagged here
-as a good candidate for a focused follow-up.
+Every external HTTP call this app makes is now bounded — a reusable
+helper (`src/lib/upstreamTimeout.ts`) wraps `fetch()` with a real
+`AbortController` (the connection is actually torn down, not just
+abandoned) and throws a clean `UpstreamTimeoutError` (service name +
+timeout only — never a URL, header, or token) if the timeout elapses:
+
+| Service | Where | Timeout | Retried? |
+|---|---|---|---|
+| Gmail (read) | `gmail.ts` (`request()`, `verifyGmailAccessToken`) | 15s | No |
+| Outlook (read) | `outlook.ts` (`request()`, `verifyOutlookAccessToken`) | 15s | No |
+| Outlook (mutations: move/archive/delete/mark/flag/category/reply/forward) | `outlookActions.ts` (`graphFetch`) | 20s | **Never** — see below |
+| Google OAuth token exchange/refresh/revoke | `googleOAuth.ts` | 10s | No |
+| Microsoft OAuth token exchange/refresh | `microsoftOAuth.ts` | 10s | No |
+| OpenAI (chat + Whisper transcription) | `openai.ts` (`OpenAI` client's own `timeout` option) | 30s | SDK default (safe — see below) |
+| Web Push send | `push.ts` (`withTimeout()`, since `web-push` makes its own internal HTTPS request with no timeout option of its own) | 10s | No |
+
+**Why mutations are never auto-retried**: `outlookActions.ts`'s
+`graphFetch` (the single low-level call every move/archive/delete/mark/
+flag/category/reply/forward tool goes through) has no retry logic at
+all, on timeout or any other failure — the first attempt may have
+already reached Microsoft before a timeout fires locally, so retrying
+could duplicate a real mailbox mutation (e.g. sending a reply twice).
+A timeout is reported as exactly one failed attempt for that
+message/action, identical to any other error, and it's the human's
+call whether to ask again. OpenAI calls are the one place the SDK's
+own default retry-on-timeout is left enabled, deliberately: those are
+stateless text/transcription generation, not mailbox mutations, so a
+retry cannot duplicate a real-world external action — worst case is
+redundant API cost, not a duplicate side effect.
+
+**Approval safety under a timeout**: a timeout during an approved
+tool's `execute()` propagates like any other error into
+`approvals.ts`'s existing `executeApproval()` try/catch, which marks
+the approval `failed` (never leaves it stuck `approved`-but-unexecuted,
+never marks it `executed` when it wasn't) — this required no changes to
+`approvals.ts` itself, since it already treated every `execute()`
+failure this way. Verified with real fake-timers-driven tests that
+simulate a fully unresponsive upstream: `tests/unit/upstream-timeout.test.ts`
+(11 tests — core helper behavior, Gmail/Outlook read timeouts, an
+Outlook mutation timeout producing exactly one failed attempt with zero
+retries, and a full approve→execute→timeout flow ending `failed` with
+no secret in the stored error and no duplicate network call on replay).
 
 ## Verified before calling this done
 
@@ -995,7 +1038,7 @@ as a good candidate for a focused follow-up.
   injected content. No claim here should be read as "a real LinkedIn
   account was connected" — that is not a capability this build has.
 
-### Production Readiness + Real-World Validation audit (this session)
+### Production Readiness + Real-World Validation audit (prior session)
 
 A dedicated penetration-style audit was performed against the actual code
 (not prior reports) — see "Production Readiness" above for the resulting
@@ -1082,16 +1125,67 @@ manual checklists and roadmap notes. Summary:
   the Email page instead, which do this correctly), and OAuth for any
   social platform — those require you to register apps with each provider
   and decide which ones you actually want first.
-- **No voice input/output exists anywhere in this codebase** (verified by
-  a repo-wide scan for speech/microphone/TTS code — see
-  `tests/unit/voice-command-scope.test.ts`) and none was added this
-  session. This matters for the security model: every command, typed or
-  hypothetically spoken, has exactly one path into a tool (`invokeTool()`
-  in `src/lib/tools/execute.ts`) and exactly one path to actually mutate a
-  mailbox (an `EXTERNAL_ACTION` tool's `execute()`, reachable only from
-  `approvals.ts` after a real approval decision). There is no alternate,
-  voice-specific route to either — so if voice input is added later, it
-  can only ever produce text/tool-calls that go through this same gate;
-  it cannot get a new, weaker path of its own without changing this
-  architecture. No feature described anywhere in this README as
-  "voice-controlled" exists — do not test or advertise it as if it does.
+  <!-- Note: an earlier draft of this paragraph claimed no voice
+  input/output existed in this codebase. That was true only before the
+  Voice feature was built (see the "## Voice" section above, and
+  tests/unit/voice-*.test.ts) and was left here stale by mistake in a
+  prior session; removed rather than left to contradict the rest of this
+  document. -->
+  Voice input/output exists (see "## Voice" above) but keeps exactly the
+  same one-path-in guarantee described in that section's diagram: every
+  command, typed or spoken, goes through `invokeTool()`
+  (`src/lib/tools/execute.ts`), and an `EXTERNAL_ACTION` tool's
+  `execute()` is reachable only from `approvals.ts` after a real approval
+  decision — there is no voice-specific shortcut to either.
+
+### Remaining production issues fixed (this session)
+
+Addresses the two genuine findings from the prior audit — upstream
+timeouts and the UTC-only briefing date — plus a full regression pass.
+
+- **Upstream timeouts**: implemented for every external HTTP call in the
+  app (Gmail, Outlook reads, Outlook mutations, Google/Microsoft OAuth,
+  OpenAI, Web Push) — see "Upstream request timeouts" above for the exact
+  table of services/timeouts/retry policy. 11 new tests
+  (`tests/unit/upstream-timeout.test.ts`), using fake timers to simulate
+  a fully unresponsive upstream without ever actually waiting — cover the
+  6 required categories: upstream timeout, aborted request (the
+  underlying socket actually receives the abort, verified via a spied
+  `AbortSignal` listener), controlled error response, no secret leakage,
+  approval state remains safe after timeout, and no duplicate external
+  action after timeout.
+- **Timezone foundation**: implemented (not just documented this time) —
+  see "Timezone" above. Extends the existing per-user `preferences` row
+  rather than creating a new settings mechanism; server-side IANA
+  validation on every write; UTC fallback everywhere a timezone is
+  missing or invalid; migration is additive and idempotent. 36 new tests
+  across `tests/unit/timezone.test.ts` (27 — validation, fallback,
+  local-date math, storage) and `tests/unit/daily-briefing-timezone.test.ts`
+  (9 — the exact required matrix: UTC, positive offset, negative offset,
+  midnight boundary, invalid timezone, missing timezone, repeated
+  generation, same local day across different UTC timestamps, plus
+  changing the preference mid-use). No scheduler was built or implied.
+- **No new security issues found** during this session's re-audit.
+  Structurally re-verified after all the above changes: still exactly one
+  `.execute()` call site in the whole codebase (`approvals.ts`), still no
+  `NEXT_PUBLIC_*`/direct-env-reference leak of the OpenAI key, fresh
+  production bundle grepped clean for the real API key, VAPID private
+  key, app encryption key, and admin password. Live re-verified against
+  the real running dev server with two independent real sessions (17/17
+  checks): unauthenticated access still 401s on every checked route
+  (including the new `/api/preferences` timezone endpoint), CSRF still
+  enforced, cross-user isolation still holds for notifications and
+  preferences, the approval-security matrix (nonexistent/foreign/stale
+  revision) still behaves correctly, and — new this session — a hostile
+  SQL-injection-shaped string submitted as a timezone value is rejected
+  with 400 and the `users` table is confirmed untouched afterward.
+  Mobile re-verified at 390×844/393×852 (7 screens including the new
+  Timezone setting) with zero console errors and zero horizontal
+  overflow.
+- **Full regression**: `npm test` 318/318 (282 carried over + 36 new),
+  `npm run lint` clean, `npx tsc --noEmit` clean, `npm run build` clean,
+  `npm audit` 0 vulnerabilities.
+- **Not implemented, per this phase's explicit scope**: a production
+  scheduler/cron (still just the documented recommendation above),
+  additional Microsoft Graph permissions, LinkedIn automation, Gmail
+  sending, always-listening voice — none of these were touched.
