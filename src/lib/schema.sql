@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS email_summaries (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   summary_date TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'gmail', -- which connected account this briefing was generated from
   summary_text TEXT NOT NULL DEFAULT '',
   urgent_json TEXT NOT NULL DEFAULT '[]',
   action_required_json TEXT NOT NULL DEFAULT '[]',

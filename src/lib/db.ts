@@ -43,6 +43,7 @@ function openDatabase(): Database.Database {
   const schemaPath = path.join(process.cwd(), "src", "lib", "schema.sql");
   const schema = fs.readFileSync(schemaPath, "utf-8");
   db.exec(schema);
+  runMigrations(db);
 
   // WAL mode creates -wal/-shm sidecar files on first write (the schema
   // exec above), which also hold live data — restrict those too.
@@ -51,6 +52,32 @@ function openDatabase(): Database.Database {
   chmodIfExists(`${dbPath}-shm`, 0o600);
 
   return db;
+}
+
+/**
+ * Additive, backwards-compatible schema changes for columns added after a
+ * database already existed. `CREATE TABLE IF NOT EXISTS` (in schema.sql)
+ * only affects brand-new databases — it never alters an existing table —
+ * so a new column on an existing table needs an explicit ALTER TABLE here.
+ * Each statement is wrapped so "duplicate column name" (already applied,
+ * every run after the first) is silently ignored; any other failure is
+ * rethrown, since that indicates a real problem rather than "already
+ * migrated". This never drops or rewrites existing data.
+ */
+function runMigrations(db: Database.Database): void {
+  const migrations = [
+    "ALTER TABLE email_summaries ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail'",
+  ];
+  for (const sql of migrations) {
+    try {
+      db.exec(sql);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.toLowerCase().includes("duplicate column name")) {
+        throw err;
+      }
+    }
+  }
 }
 
 // Opened lazily, on first real query, rather than at module import time.

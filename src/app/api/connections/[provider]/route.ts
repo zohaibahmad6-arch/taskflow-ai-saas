@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
 import { disconnectProvider, getConnection, getDecryptedTokens } from "@/lib/connections";
 import { revokeGoogleToken } from "@/lib/googleOAuth";
+import { revokeMicrosoftToken } from "@/lib/microsoftOAuth";
 import { writeAuditEvent } from "@/lib/audit";
 
 const OAUTH_ENV_HINT: Record<string, string> = {
@@ -35,6 +36,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ pro
         await revokeGoogleToken(tokens.refreshToken ?? tokens.accessToken).catch(() => false);
       }
     }
+    if (provider === "outlook") {
+      // Best-effort only: the Microsoft identity platform has no public
+      // revoke REST API for this token type (see microsoftOAuth.ts) — this
+      // always returns false. Local disconnect below still fully removes
+      // the stored tokens regardless.
+      await revokeMicrosoftToken().catch(() => false);
+    }
 
     disconnectProvider(session.user.id, provider);
     writeAuditEvent({
@@ -53,6 +61,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ pro
       // client must navigate to this URL (a top-level browser
       // navigation), not fetch() it.
       return NextResponse.json({ redirectTo: "/api/oauth/gmail/start" });
+    }
+    if (provider === "outlook") {
+      return NextResponse.json({ redirectTo: "/api/oauth/outlook/start" });
     }
 
     // Honest stub: no real OAuth app is registered for this deployment yet.

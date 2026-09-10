@@ -2,7 +2,7 @@ import "server-only";
 import { z } from "zod";
 import { db, newId, nowIso } from "../db";
 import { generateText } from "../openai";
-import { getEmailProvider } from "./index";
+import { getEmailProvider, getEmailProviderById, type KnownEmailProviderId } from "./index";
 import { wrapUntrustedEmailContent } from "./promptSafety";
 import type { EmailMessageSummary } from "./provider";
 
@@ -28,6 +28,7 @@ export type DeadlineItem = BriefingItem & { deadline: string };
 export type EmailBriefing = {
   id: string;
   summaryDate: string;
+  provider: string;
   summaryText: string;
   urgent: BriefingItem[];
   actionRequired: BriefingItem[];
@@ -47,12 +48,13 @@ function storeBriefing(userId: string, briefing: Omit<EmailBriefing, "id" | "cre
   const createdAt = nowIso();
   db.prepare(
     `INSERT INTO email_summaries
-       (id, user_id, summary_date, summary_text, urgent_json, action_required_json, follow_up_json, fyi_json, deadlines_json, source_message_ids_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, user_id, summary_date, provider, summary_text, urgent_json, action_required_json, follow_up_json, fyi_json, deadlines_json, source_message_ids_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     userId,
     briefing.summaryDate,
+    briefing.provider,
     briefing.summaryText,
     JSON.stringify(briefing.urgent),
     JSON.stringify(briefing.actionRequired),
@@ -68,6 +70,7 @@ function storeBriefing(userId: string, briefing: Omit<EmailBriefing, "id" | "cre
 type BriefingRow = {
   id: string;
   summary_date: string;
+  provider: string;
   summary_text: string;
   urgent_json: string;
   action_required_json: string;
@@ -82,6 +85,7 @@ function rowToBriefing(row: BriefingRow): EmailBriefing {
   return {
     id: row.id,
     summaryDate: row.summary_date,
+    provider: row.provider,
     summaryText: row.summary_text,
     urgent: JSON.parse(row.urgent_json),
     actionRequired: JSON.parse(row.action_required_json),
@@ -93,10 +97,15 @@ function rowToBriefing(row: BriefingRow): EmailBriefing {
   };
 }
 
-export function getLatestBriefing(userId: string): EmailBriefing | null {
-  const row = db
-    .prepare("SELECT * FROM email_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
-    .get(userId) as BriefingRow | undefined;
+/** Latest briefing overall, or for a specific provider when one is given. */
+export function getLatestBriefing(userId: string, provider?: string): EmailBriefing | null {
+  const row = provider
+    ? (db
+        .prepare("SELECT * FROM email_summaries WHERE user_id = ? AND provider = ? ORDER BY created_at DESC LIMIT 1")
+        .get(userId, provider) as BriefingRow | undefined)
+    : (db
+        .prepare("SELECT * FROM email_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+        .get(userId) as BriefingRow | undefined);
   return row ? rowToBriefing(row) : null;
 }
 
@@ -172,12 +181,19 @@ export function toTrustedDeadlineItems(
  * Fetches recent messages via the connected provider, asks the model to
  * triage them, and stores the result. Throws (never fabricates a
  * briefing) if no provider is connected or the fetch fails.
+ *
+ * `providerId` selects which connected account to summarize. When
+ * omitted, falls back to whichever single account is connected (existing
+ * single-account behavior, unchanged) — callers that can see more than
+ * one connected provider (getConnectedEmailProviders) must pass one
+ * explicitly rather than silently picking for the user.
  */
-export async function generateAndStoreBriefing(userId: string): Promise<EmailBriefing> {
-  const provider = getEmailProvider(userId);
+export async function generateAndStoreBriefing(userId: string, providerId?: KnownEmailProviderId): Promise<EmailBriefing> {
+  const provider = providerId ? getEmailProviderById(userId, providerId) : getEmailProvider(userId);
   if (!provider) {
-    throw new Error("No email account is connected.");
+    throw new Error(providerId ? `${providerId} is not connected.` : "No email account is connected.");
   }
+  const resolvedProviderId = providerId ?? provider.providerId;
 
   const messages = await provider.getRecentMessages(20);
   const byId = new Map(messages.map((m) => [m.id, m]));
@@ -185,6 +201,7 @@ export async function generateAndStoreBriefing(userId: string): Promise<EmailBri
   if (messages.length === 0) {
     return storeBriefing(userId, {
       summaryDate: todayDate(),
+      provider: resolvedProviderId,
       summaryText: "No recent messages found.",
       urgent: [],
       actionRequired: [],
@@ -237,6 +254,7 @@ export async function generateAndStoreBriefing(userId: string): Promise<EmailBri
 
   return storeBriefing(userId, {
     summaryDate: todayDate(),
+    provider: resolvedProviderId,
     summaryText: parsed.summaryText,
     urgent: toTrustedItems(parsed.urgent, byId),
     actionRequired: toTrustedItems(parsed.actionRequired, byId),

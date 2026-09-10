@@ -65,6 +65,23 @@ export const env = {
         process.env.GOOGLE_OAUTH_REDIRECT_URI
     );
   },
+  get microsoftOAuthClientId() {
+    return required("MICROSOFT_OAUTH_CLIENT_ID");
+  },
+  get microsoftOAuthClientSecret() {
+    return required("MICROSOFT_OAUTH_CLIENT_SECRET");
+  },
+  /** Must exactly match a redirect URI registered on the Azure AD app registration. */
+  get microsoftOAuthRedirectUri() {
+    return required("MICROSOFT_OAUTH_REDIRECT_URI");
+  },
+  get microsoftOAuthConfigured() {
+    return Boolean(
+      process.env.MICROSOFT_OAUTH_CLIENT_ID &&
+        process.env.MICROSOFT_OAUTH_CLIENT_SECRET &&
+        process.env.MICROSOFT_OAUTH_REDIRECT_URI
+    );
+  },
   /**
    * Whether this deployment sits behind a reverse proxy/load balancer that
    * can be trusted to set (and strip any client-supplied copy of)

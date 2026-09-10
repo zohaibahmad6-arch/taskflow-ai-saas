@@ -65,6 +65,16 @@ function zodToJsonSchema(schema: any): Record<string, unknown> {
   if (schema instanceof z.ZodOptional) {
     return zodToJsonSchema(schema.unwrap());
   }
+  if (schema instanceof z.ZodDefault) {
+    // A defaulted field is optional to provide (same JSON-schema
+    // "not required" treatment as ZodOptional above) — describe the
+    // underlying type, the default itself isn't representable here.
+    return zodToJsonSchema(def.innerType);
+  }
+  if (schema instanceof z.ZodLiteral) {
+    const value = Array.isArray(def.values) ? def.values[0] : def.value;
+    return { type: typeof value, enum: [value] };
+  }
   if (schema instanceof z.ZodNumber) {
     return { type: "number" };
   }
