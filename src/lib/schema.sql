@@ -210,6 +210,87 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Verified candidate profile/CV facts — the single source of truth job
+-- matching and screening-answer preparation are grounded against. Nothing
+-- in the jobs feature may invent experience/qualifications/certifications
+-- not present here (or in cv_text); "unknown" is always the honest
+-- fallback for anything not covered. High-stakes screening fields (right
+-- to work, notice period, salary expectation, relocation/travel) are
+-- entered directly by the user, never AI-inferred.
+CREATE TABLE IF NOT EXISTS candidate_profile (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  full_name TEXT,
+  headline TEXT,
+  location TEXT,
+  years_experience INTEGER,
+  cv_text TEXT NOT NULL DEFAULT '', -- free-text CV/resume the user pasted; primary grounding source for matching
+  skills_json TEXT NOT NULL DEFAULT '[]',
+  certifications_json TEXT NOT NULL DEFAULT '[]', -- [{name, issuer, year}]
+  employment_json TEXT NOT NULL DEFAULT '[]', -- [{employer, title, startDate, endDate, description}]
+  education_json TEXT NOT NULL DEFAULT '[]', -- [{institution, degree, field, year}]
+  right_to_work TEXT, -- e.g. "UK citizen", "requires sponsorship" — user-entered, never inferred
+  notice_period TEXT,
+  salary_expectation TEXT,
+  willing_to_relocate TEXT, -- free text/tri-state, e.g. "yes", "no", "case by case" — null = unknown
+  willing_to_travel TEXT,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Normalized job postings. Always captured from text the USER pasted (from
+-- LinkedIn or anywhere else they're browsing themselves) — never fetched
+-- via automated search or scraping, since no legitimate LinkedIn API for
+-- that exists for this app (see README). source_url/description are
+-- exactly what the user provided; extracted_json holds the AI's
+-- structured read of that text (requirements, responsibilities, etc.) —
+-- analysis, never a claim of additional fetched information.
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source TEXT NOT NULL DEFAULT 'linkedin_pasted', -- linkedin_pasted | manual
+  source_url TEXT,
+  title TEXT NOT NULL,
+  company TEXT NOT NULL,
+  location TEXT,
+  description TEXT NOT NULL, -- the raw pasted posting text, verbatim
+  employment_type TEXT, -- e.g. full-time | contract | unknown
+  experience_level TEXT,
+  salary TEXT,
+  posted_at TEXT, -- free text as stated in the posting ("2 days ago"), or NULL if unknown — never computed/guessed
+  easy_apply_status TEXT NOT NULL DEFAULT 'unknown', -- verified | not_available | unknown — verified ONLY on literal textual evidence, never inferred
+  application_type TEXT NOT NULL DEFAULT 'unknown', -- easy_apply | external | unknown
+  application_url TEXT,
+  extracted_json TEXT NOT NULL DEFAULT '{}', -- AI-extracted structured requirements/responsibilities/etc — see jobs/extraction.ts
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_user_created ON jobs(user_id, created_at DESC);
+
+-- Application preparation/tracking per job. Nothing here represents a
+-- real LinkedIn submission unless status = 'submitted', and that status
+-- is only ever set by the user's own explicit self-report (jobs.markSubmitted)
+-- after they complete it themselves on LinkedIn — this app has no
+-- legitimate way to submit or verify a LinkedIn application (see README),
+-- so it never claims to have done so.
+CREATE TABLE IF NOT EXISTS job_applications (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'prepared', -- prepared | awaiting_approval | ready_for_manual_submission | submitted | failed | blocked | unknown
+  match_score INTEGER, -- 0-100, computed from match_reasons_json, never a raw AI-invented number
+  match_reasons_json TEXT NOT NULL DEFAULT '[]', -- [{requirement, level: strong|partial|gap|unknown, evidence}]
+  cv_note TEXT, -- which CV/profile snapshot was used (this build has one profile, so mostly informational)
+  cover_letter TEXT,
+  screening_answers_json TEXT NOT NULL DEFAULT '[]', -- [{question, answer, source: profile|user_provided|unknown}]
+  missing_info_json TEXT NOT NULL DEFAULT '[]',
+  approval_id TEXT,
+  submitted_at TEXT, -- set only by the user's own self-report, never by execute()
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_applications_user_job ON job_applications(user_id, job_id);
+
 -- Simple in-DB rate-limit ledger so limits survive process restarts.
 CREATE TABLE IF NOT EXISTS rate_limit_hits (
   bucket_key TEXT NOT NULL,

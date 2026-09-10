@@ -6,6 +6,7 @@ import { LogoutButton } from "@/components/LogoutButton";
 const ITEMS = [
   { href: "/settings/account", label: "Account", desc: "Your profile and sign-in" },
   { href: "/settings/connections", label: "Connected Services", desc: "Email and social accounts" },
+  { href: "/settings/profile", label: "Profile / CV", desc: "Verified facts job matching is grounded against" },
   { href: "/settings/content-style", label: "Content Style", desc: "How the AI writes for you" },
   { href: "/settings/security", label: "Security", desc: "Password, approvals, sessions" },
   { href: "/settings/notifications", label: "Notifications", desc: "Mobile alerts" },

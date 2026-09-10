@@ -7,6 +7,7 @@ const ITEMS = [
   { href: "/home", label: "Home", icon: HomeIcon },
   { href: "/ai", label: "AI", icon: SparkIcon },
   { href: "/email", label: "Email", icon: MailIcon },
+  { href: "/jobs", label: "Jobs", icon: BriefcaseIcon },
   { href: "/social", label: "Social", icon: ShareIcon },
   { href: "/approvals", label: "Approvals", icon: CheckIcon },
   { href: "/activity", label: "Activity", icon: ClockIcon },
@@ -83,6 +84,15 @@ function MailIcon({ active }: IconProps) {
     <svg {...iconProps(active)}>
       <rect x="3" y="5" width="18" height="14" rx="2" />
       <path d="m4 7 8 6 8-6" />
+    </svg>
+  );
+}
+function BriefcaseIcon({ active }: IconProps) {
+  return (
+    <svg {...iconProps(active)}>
+      <rect x="3" y="7" width="18" height="13" rx="2" />
+      <path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M3 12h18" />
     </svg>
   );
 }
