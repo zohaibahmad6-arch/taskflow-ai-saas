@@ -139,9 +139,14 @@ const publishPostTool: ToolDefinition<z.infer<typeof publishPostInput>, z.infer<
   inputSchema: publishPostInput,
   payloadHint: "Fields: platform, content",
   approvalPayloadSchema: publishPostPayload,
-  resolvePayload: async (input) => {
+  resolvePayload: async (input, ctx) => {
     const draft = getSocialDraft(input.draftId);
-    if (!draft) throw new Error("Draft not found.");
+    // Ownership check is mandatory here, not optional: this tool is reachable
+    // directly from chat/voice with a model-supplied draftId, not only from
+    // the already-scoped PATCH /api/social/drafts/[id] route. Without this
+    // check, a caller who supplies another user's draftId would have that
+    // user's private draft content read into their OWN approval.
+    if (!draft || draft.user_id !== ctx.userId) throw new Error("Draft not found.");
     return { platform: draft.platform as (typeof PLATFORMS)[number], content: draft.content, draftId: draft.id };
   },
   describePayload: async (payload) => ({
