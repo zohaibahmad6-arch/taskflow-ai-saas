@@ -732,6 +732,121 @@ nothing result.
    Serve over HTTPS in production — the app sets `Secure` cookies and HSTS
    once `NODE_ENV=production`.
 
+## Production Readiness (manual validation checklists + roadmap notes)
+
+This section exists because a sandboxed dev environment cannot reach
+`api.openai.com` and has no real Google/Microsoft OAuth app registered —
+so the checks below have been *architected and code-reviewed*, but need
+to be *run by you, once, with real credentials* before you trust this for
+daily personal use. None of them were faked as passing.
+
+### OpenAI real-integration checklist
+
+Key hygiene is already verified (server-only `env.openaiApiKey`, never a
+`NEXT_PUBLIC_*` var, never logged, grepped clean out of `.next/static` —
+see `src/lib/openai.ts`). To confirm a real call actually works once you
+have outbound network access to `api.openai.com`:
+
+1. `npm run dev`, log in, open AI Chat, send a real message → expect a
+   real model reply, not a 502.
+2. Settings → Connected Services → connect Gmail or Outlook, then ask
+   "Summarize my inbox" → expect real categorized output grounded in your
+   actual messages, not fabricated content.
+3. Check `./data/app.db`'s `audit_events` table afterward — `detail_json`
+   should never contain your OpenAI key, an email body, or a raw prompt.
+
+### Gmail connect checklist (run once you have real Google OAuth credentials)
+
+1. Settings → Connected Services → Connect Gmail → complete Google's
+   consent screen → land back on `/email` showing "Connected as
+   you@gmail.com" (verified via a real Gmail API call, not just the
+   redirect succeeding).
+2. Ask "Summarize my inbox" → real categorized Urgent/Action
+   Required/Follow Up/FYI/Deadlines output.
+3. Ask the assistant to send or delete anything → confirm it refuses
+   (Gmail has no send/modify/delete scope; `email.send`'s `execute()` is a
+   hard-coded, honest failure — see "What is intentionally NOT faked").
+4. Settings → Connected Services → Disconnect → confirm `connected_at`/
+   `encrypted_tokens` are cleared in the DB and a fresh "Connect" is
+   required to use it again.
+5. Revoke access from your Google Account's own "Third-party access"
+   page, then try an action here → confirm it fails with an honest
+   "reconnect" message (`auth_expired`), never a silent stale success.
+
+### Outlook connect checklist (run once you have real Azure app credentials)
+
+1. Settings → Connected Services → Connect Outlook → Microsoft consent
+   screen → land back showing "Connected as you@outlook.com".
+2. Ask "Sort my emails" → real classification + a proposed move plan →
+   confirm **nothing moves** until you say "approve", then confirm
+   *exactly* the previewed list moved (check the folder in real Outlook).
+3. Ask it to reply to or delete a real message → confirm an Approval
+   Center entry appears with the literal content, and only your explicit
+   approval executes it — check the real mailbox afterward.
+4. Edit a pending approval's content in the Approval Center before
+   approving → confirm the *edited* text is what actually sent/moved, not
+   the original.
+5. Disconnect, then reconnect → confirm no duplicate `connected_accounts`
+   row (schema has `UNIQUE(user_id, provider)`).
+
+### Timezone (current status + smallest safe path forward)
+
+**Current behavior**: `daily_briefings.briefing_date` is the UTC calendar
+date (`new Date().toISOString().slice(0, 10)` in `dailyBriefing.ts`).
+Because generation is on-demand (opening the app, not a midnight cron),
+this only matters right around UTC midnight — a briefing opened at
+11:59pm UTC and again at 12:01am UTC is (correctly) treated as two
+different days, which may not match the user's own local "today" if
+their timezone is far from UTC.
+
+**Recommended smallest-safe change**, not implemented here (out of
+scope for this phase, and pointless without a scheduler to make use of
+it):
+1. Add one nullable column: `ALTER TABLE preferences ADD COLUMN
+   timezone TEXT` (IANA name, e.g. `"America/New_York"`), via the
+   existing idempotent migration pattern in `db.ts`.
+2. Add a Settings field for the user to set it (or auto-detect via
+   `Intl.DateTimeFormat().resolvedOptions().timeZone` client-side once, on
+   first login, and POST it).
+3. Change exactly one function, `todayDateUTC()` in `dailyBriefing.ts`,
+   to compute "today" in that timezone instead of UTC (e.g. via
+   `Intl.DateTimeFormat` with the `timeZone` option) — everything else
+   (idempotency, dedup, storage) already works off an opaque date string
+   and needs no change.
+4. **Effect on idempotency**: none — `UNIQUE(user_id, briefing_date)`
+   keeps working identically; the date string it uniques on would simply
+   be computed in the user's zone instead of UTC.
+
+### Scheduler (current status + recommended production architecture)
+
+**Current status, confirmed by code inspection**: no `setInterval`,
+`node-cron`, or any other timer-based execution exists anywhere in this
+codebase (verified — see `tests/unit/briefing-voice-scheduling.test.ts`'s
+structural check). `generateDailyBriefing(userId)` is a plain async
+function, safe to call from anywhere, any number of times, without risk
+of duplicating a briefing or spamming notifications.
+
+**Recommended production architecture** (not implemented — this phase
+was explicit that a fake in-process scheduler must not be built): a
+platform-native scheduled job — e.g. Vercel Cron, a hosting provider's
+cron add-on, or a system crontab entry if self-hosting — hitting a new,
+authenticated-by-a-shared-secret endpoint (not the user's session
+cookie, since no browser is open) once a day per user, which calls
+`generateDailyBriefing(userId, { forceRefresh: false })` and, if push is
+configured, lets the existing `notifyUser()` dedup logic decide whether
+a notification is actually warranted. Nothing about `dailyBriefing.ts`
+needs to change to support this.
+
+### Known, non-blocking hardening recommendation (not applied this phase)
+
+`src/lib/email/gmail.ts` and `outlook.ts`'s `fetch()` calls (and the
+OpenAI SDK's own calls) have no explicit request timeout/`AbortController`
+— an unresponsive upstream could hold a request open longer than ideal.
+Not fixed in this phase (touches multiple files with no existing test
+coverage for timeout behavior, and the master prompt for this phase asked
+for genuine defects to be fixed, not speculative hardening); flagged here
+as a good candidate for a focused follow-up.
+
 ## Verified before calling this done
 
 - `npm run build`, `npm run lint`, and `npm audit` all pass clean (0
@@ -879,6 +994,59 @@ nothing result.
   and the full capture→match→prepare→submit-approval pipeline with hostile
   injected content. No claim here should be read as "a real LinkedIn
   account was connected" — that is not a capability this build has.
+
+### Production Readiness + Real-World Validation audit (this session)
+
+A dedicated penetration-style audit was performed against the actual code
+(not prior reports) — see "Production Readiness" above for the resulting
+manual checklists and roadmap notes. Summary:
+
+- **One real, confirmed security defect was found and fixed**:
+  `social.publishPost`'s `resolvePayload` fetched a draft by id with no
+  ownership check, reachable directly from chat/voice (not only the
+  already-scoped `PATCH /api/social/drafts/[id]` route) — a user who
+  supplied another user's `draftId` would have that user's private draft
+  content read into their OWN pending approval. Fixed by checking
+  `draft.user_id === ctx.userId`, matching every other `resolvePayload` in
+  the codebase (`tests/unit/social-draft-isolation.test.ts`, 4 tests).
+  Commit `f5349c0`.
+- **Structurally re-verified** (grep across the entire `src/` tree, not
+  re-trusting prior claims): exactly one `.execute()` call site exists in
+  the whole codebase (`approvals.ts`'s `executeApproval`); every
+  `outlookActions.*` mutation call is inside an `EXTERNAL_ACTION` tool's
+  `execute()`; no `NEXT_PUBLIC_*`/direct env reference to the OpenAI key
+  outside `env.ts`; no `setInterval`/cron anywhere.
+- **Live-verified against a real running server with two independent,
+  real HTTP sessions** (not unit-test mocks) — 12/12 checks passed:
+  unauthenticated access to `/api/briefing`, `/api/notifications`,
+  `/api/approvals` all correctly 401; a mutating POST without the CSRF
+  header correctly 403 and the identical request WITH it correctly
+  succeeds; a second real user's notifications/briefing were completely
+  invisible to the first user's session, and the first user's attempt to
+  mark the second user's notification read was a genuine no-op (verified
+  by re-reading the second user's own session afterward, not just by the
+  response code); `POST /api/chat` against this sandbox's blocked OpenAI
+  egress failed with a clean 502 and no stack trace.
+- **Live-verified approval security matrix, real HTTP, real DB state**
+  — 8/8 checks passed: approve a nonexistent approval → 404; approve
+  another (real, independently-logged-in) user's approval → 404 and it
+  stays pending; approve an already-rejected approval → 400; approve an
+  already-executed approval → 400 (no re-decision, no double-execution);
+  approve an expired approval → 400 and it flips to `expired`; a stale
+  revision (server has revision 3, client thinks 0) → 409 and the
+  approval is untouched; a genuine approve of one's own valid approval
+  reaches `executed`/`failed` (never stuck at `approved` unexecuted), and
+  replaying that same decision afterward correctly fails rather than
+  re-running the side effect.
+- **Live-verified mobile**: all 9 primary screens × both target
+  viewports (390×844, 393×852) — zero console/page errors, zero
+  horizontal overflow.
+- **No unrelated changes were made.** No new dependencies were added. No
+  feature listed under "do not implement yet" was touched.
+- All test-only artifacts (a second user row, seeded notifications/
+  drafts/approvals created purely to exercise isolation) were deleted
+  from the real dev database (`./data/app.db`) after verification —
+  confirmed by re-querying row counts afterward.
 - **Voice — REAL vs. MOCKED, stated plainly**: this environment has no
   microphone hardware and no real network egress to `api.openai.com`, so
   **no real end-to-end voice interaction occurred** — no real audio was
