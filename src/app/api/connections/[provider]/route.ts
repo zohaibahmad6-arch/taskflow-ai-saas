@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
-import { disconnectProvider, getConnection } from "@/lib/connections";
+import { disconnectProvider, getConnection, getDecryptedTokens } from "@/lib/connections";
+import { revokeGoogleToken } from "@/lib/googleOAuth";
 import { writeAuditEvent } from "@/lib/audit";
 
 const OAUTH_ENV_HINT: Record<string, string> = {
-  gmail: "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET",
+  gmail: "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URI",
   outlook: "MICROSOFT_OAUTH_CLIENT_ID / MICROSOFT_OAUTH_CLIENT_SECRET",
   linkedin: "LINKEDIN_OAUTH_CLIENT_ID / LINKEDIN_OAUTH_CLIENT_SECRET",
   x: "X_OAUTH_CLIENT_ID / X_OAUTH_CLIENT_SECRET",
@@ -24,6 +25,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ pro
   const action = body?.action;
 
   if (action === "disconnect") {
+    // Best-effort revoke at the provider using the token we're about to
+    // discard, BEFORE discarding it — never blocks the local disconnect
+    // on this succeeding (the user must always be able to disconnect
+    // locally even if the provider is unreachable).
+    if (provider === "gmail") {
+      const tokens = getDecryptedTokens(session.user.id, "gmail");
+      if (tokens) {
+        await revokeGoogleToken(tokens.refreshToken ?? tokens.accessToken).catch(() => false);
+      }
+    }
+
     disconnectProvider(session.user.id, provider);
     writeAuditEvent({
       userId: session.user.id,
@@ -36,6 +48,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ pro
   }
 
   if (action === "connect") {
+    if (provider === "gmail") {
+      // Gmail uses a real OAuth redirect flow, not a JSON action — the
+      // client must navigate to this URL (a top-level browser
+      // navigation), not fetch() it.
+      return NextResponse.json({ redirectTo: "/api/oauth/gmail/start" });
+    }
+
     // Honest stub: no real OAuth app is registered for this deployment yet.
     // We do not fake a "connected" state. Wiring up real OAuth is a
     // follow-up development task once you have provider credentials.

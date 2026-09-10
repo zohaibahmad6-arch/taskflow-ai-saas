@@ -85,7 +85,11 @@ export async function invokeTool(
     toolId,
     eventType: "info",
     summary: `${tool.name} ran (${tool.permissionLevel.toLowerCase()})`,
-    detail: result.output,
+    // Prefer the tool's own redacted summary when it provides one — see
+    // ToolResult.auditSafeSummary. Third-party content (an email body, a
+    // message snippet) must never become a second copy of itself sitting
+    // in the audit log.
+    detail: result.auditSafeSummary ?? result.output,
   });
 
   return result;

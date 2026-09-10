@@ -36,6 +36,15 @@ export type ToolResult = {
   output: Record<string, unknown>;
   /** true if this call created a pending approval instead of acting. */
   awaitingApproval?: boolean;
+  /**
+   * What gets written to the audit log for this call INSTEAD of `output`.
+   * Tools whose `output` can contain private content pulled from a
+   * third-party source (an email body, a message snippet) should set
+   * this to a content-free summary (e.g. counts, ids) — the audit log
+   * must never become a second copy of someone's inbox. When omitted,
+   * READ_ONLY/PREPARATION tools fall back to logging `output` as-is.
+   */
+  auditSafeSummary?: Record<string, unknown>;
 };
 
 export type ToolDefinition<TInput = unknown, TPayload = TInput> = {

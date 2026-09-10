@@ -37,33 +37,57 @@ CREATE TABLE IF NOT EXISTS preferences (
 
 -- Connected external services (email providers, social platforms).
 -- `status` is the single source of truth the UI must read from; the UI
--- must never claim a connection exists unless a row here says so.
+-- must never claim a connection exists unless a row here says so, and
+-- nothing may set status='connected' except the OAuth callback after it
+-- has verified the token against a real API call (see gmail.ts).
 CREATE TABLE IF NOT EXISTS connected_accounts (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   provider TEXT NOT NULL, -- e.g. 'gmail', 'outlook', 'linkedin', 'x', 'facebook', 'instagram'
   category TEXT NOT NULL, -- 'email' | 'social'
-  account_label TEXT,
+  account_label TEXT, -- e.g. the connected Gmail address; never a secret
   status TEXT NOT NULL DEFAULT 'not_connected', -- not_connected | connected | error | revoked
   scopes_json TEXT NOT NULL DEFAULT '[]',
-  encrypted_tokens TEXT, -- AES-256-GCM ciphertext, never plaintext
+  encrypted_tokens TEXT, -- AES-256-GCM ciphertext (JSON: access/refresh token + expiry), never plaintext
   last_error TEXT,
   connected_at TEXT,
+  last_synced_at TEXT, -- last successful real API read
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE(user_id, provider)
 );
 
+-- Single-use, short-lived OAuth CSRF state tokens. A row is created right
+-- before redirecting to the provider's consent screen and deleted the
+-- moment the callback consumes it (or expires), so a state value can
+-- never be replayed.
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  expires_at TEXT NOT NULL
+);
+
+-- Stored daily briefings. Deliberately holds only short references to
+-- source messages (id/subject/snippet), never full bodies — see
+-- src/lib/email/briefing.ts. Nothing schedules writes to this table yet;
+-- it is populated on-demand (e.g. "Summarize my inbox"), never
+-- fabricated when no provider is connected.
 CREATE TABLE IF NOT EXISTS email_summaries (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   summary_date TEXT NOT NULL,
+  summary_text TEXT NOT NULL DEFAULT '',
   urgent_json TEXT NOT NULL DEFAULT '[]',
   action_required_json TEXT NOT NULL DEFAULT '[]',
   follow_up_json TEXT NOT NULL DEFAULT '[]',
   fyi_json TEXT NOT NULL DEFAULT '[]',
   deadlines_json TEXT NOT NULL DEFAULT '[]',
+  source_message_ids_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_email_summaries_user_date ON email_summaries(user_id, summary_date DESC);
 
 CREATE TABLE IF NOT EXISTS social_drafts (
   id TEXT PRIMARY KEY,

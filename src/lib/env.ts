@@ -48,6 +48,23 @@ export const env = {
   get pushConfigured() {
     return Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
   },
+  get googleOAuthClientId() {
+    return required("GOOGLE_OAUTH_CLIENT_ID");
+  },
+  get googleOAuthClientSecret() {
+    return required("GOOGLE_OAUTH_CLIENT_SECRET");
+  },
+  /** Must exactly match a redirect URI registered on the Google Cloud OAuth client. */
+  get googleOAuthRedirectUri() {
+    return required("GOOGLE_OAUTH_REDIRECT_URI");
+  },
+  get googleOAuthConfigured() {
+    return Boolean(
+      process.env.GOOGLE_OAUTH_CLIENT_ID &&
+        process.env.GOOGLE_OAUTH_CLIENT_SECRET &&
+        process.env.GOOGLE_OAUTH_REDIRECT_URI
+    );
+  },
   /**
    * Whether this deployment sits behind a reverse proxy/load balancer that
    * can be trusted to set (and strip any client-supplied copy of)
