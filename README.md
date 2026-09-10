@@ -1196,11 +1196,21 @@ The app's architecture — a single long-running Node.js process
 (`next start`) with one local SQLite file — maps directly onto a Render
 **Web Service with a Persistent Disk**, with no code changes: no
 serverless conversion, no database swap. `render.yaml` in the repo root
-is a Blueprint for this; **its exact field names could not be verified
-against Render's live docs from this environment (network egress to
-render.com is blocked here)** — treat it as a strong starting point and
-sanity-check it against Render's current Blueprint spec / dashboard
-during your first sync, not as guaranteed-correct syntax.
+is a Blueprint for this. **Render's own docs (render.com,
+docs.render.com, render-web.onrender.com) are all unreachable from this
+environment's network egress**, so this couldn't be checked directly
+against their primary source; it was instead cross-checked via web
+search against several independent, currently-published render.yaml
+examples for other real apps with an attached disk (Strapi's hosting
+docs, ElectricSQL's Render integration docs, Render's own
+`render-examples` GitHub org) plus a structured third-party reference —
+every field matched across all of them, including the `disk` block's
+`name`/`mountPath`/`sizeGB` shape and that Render does not permit
+horizontal scaling on a service with a disk attached (so this app's
+single-instance requirement is platform-enforced, not just configured).
+That's meaningfully more confidence than an unverified guess, but still
+short of reading Render's own docs directly — sanity-check it against
+the Render dashboard's own reference during your first Blueprint sync.
 
 ### Health check
 

@@ -1,36 +1,48 @@
 # Render Blueprint for the Personal AI Assistant.
 #
-# NOTE ON VERIFICATION: this sandbox's network egress is blocked from
-# reaching render.com, so this file's exact field names could not be
-# checked live against Render's current Blueprint spec docs at
-# https://render.com/docs/blueprint-spec while writing it. The shape
-# below reflects Render's documented spec as of this codebase's last
-# training data, and is a starting point, not a guarantee — sanity-check
-# it against the "render.yaml" reference in the Render dashboard (or the
-# docs link above) before or during your first Blueprint sync, and adjust
-# any field Render's parser rejects.
+# NOTE ON VERIFICATION: render.com, docs.render.com, and
+# render-web.onrender.com are all unreachable from this sandbox's network
+# egress, so this file could not be checked directly against Render's own
+# Blueprint spec page. It WAS cross-checked via web search against
+# several independent, real, currently-published render.yaml examples for
+# other production apps with an attached disk (Strapi's own hosting docs,
+# ElectricSQL's Render integration docs, Render's own render-examples
+# GitHub org) plus a structured third-party reference — every field below
+# (runtime, buildCommand/startCommand, healthCheckPath, the disk block's
+# name/mountPath/sizeGB shape, envVars' sync:false semantics, and valid
+# `plan` values including "starter") matched across all of them. That's
+# meaningfully stronger evidence than an unverified guess, but it is
+# still not the same as reading Render's own current docs directly —
+# sanity-check this against the Render dashboard's own render.yaml
+# reference during your first Blueprint sync, and adjust anything its
+# parser rejects.
 #
 # Architecture (unchanged from the existing app, not adapted to
 # serverless): a single long-running Node.js process (`next start`)
 # reading/writing one SQLite file on a persistent disk. This is NOT
 # horizontally scalable — better-sqlite3 is a single-writer, single-process
-# connection — so this intentionally configures exactly one instance and
-# no autoscaling. Do not add a `scaling` block here.
+# connection. No `scaling`/`numInstances` block is configured here, and
+# per the same sources above, Render does not allow horizontal scaling on
+# a service with an attached persistent disk in the first place — so
+# single-instance is both this app's requirement and a platform-enforced
+# constraint once the disk below is attached, not just a convention this
+# file follows.
 
 services:
   - type: web
     name: personal-ai-assistant
     runtime: node
     plan: starter # Persistent disks require a paid plan on Render — the free tier does not support them.
-    # region: oregon   # Uncomment and pick the region nearest you; left unset here rather than guessed.
+    # region: oregon   # Valid values (per the sources above): oregon | ohio | virginia | frankfurt | singapore.
+    # Uncomment and pick the region nearest you; left unset here (defaults to oregon) rather than guessed on your behalf.
     buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
 
     disk:
       name: personal-ai-assistant-data
-      mountPath: /var/data
-      sizeGB: 1 # SQLite + WAL files are a few MB today; 1GB is generous headroom, resizable later in the Render dashboard.
+      mountPath: /var/data # Confirmed correct: this becomes DATABASE_PATH's parent directory below, persisted across deploys/restarts.
+      sizeGB: 1 # SQLite + WAL files are a few MB today; 1GB is generous headroom. Render's default is 10GB if omitted; can be increased later but not decreased.
 
     envVars:
       # --- Non-secret, safe to set directly in this file ---
