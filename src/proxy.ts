@@ -10,7 +10,10 @@ const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 // routes.
 
 const PUBLIC_PATHS = new Set(["/login", "/manifest.webmanifest"]);
-const PUBLIC_API_PREFIXES = ["/api/auth/login"];
+// /api/health is deliberately public: a hosting platform's health checker
+// (e.g. Render) has no session cookie to send, and the route itself
+// returns nothing sensitive — see its own file for what it exposes.
+const PUBLIC_API_PREFIXES = ["/api/auth/login", "/api/health"];
 
 function isPublicPath(pathname: string): boolean {
   if (PUBLIC_PATHS.has(pathname)) return true;

@@ -1,0 +1,84 @@
+# Render Blueprint for the Personal AI Assistant.
+#
+# NOTE ON VERIFICATION: this sandbox's network egress is blocked from
+# reaching render.com, so this file's exact field names could not be
+# checked live against Render's current Blueprint spec docs at
+# https://render.com/docs/blueprint-spec while writing it. The shape
+# below reflects Render's documented spec as of this codebase's last
+# training data, and is a starting point, not a guarantee — sanity-check
+# it against the "render.yaml" reference in the Render dashboard (or the
+# docs link above) before or during your first Blueprint sync, and adjust
+# any field Render's parser rejects.
+#
+# Architecture (unchanged from the existing app, not adapted to
+# serverless): a single long-running Node.js process (`next start`)
+# reading/writing one SQLite file on a persistent disk. This is NOT
+# horizontally scalable — better-sqlite3 is a single-writer, single-process
+# connection — so this intentionally configures exactly one instance and
+# no autoscaling. Do not add a `scaling` block here.
+
+services:
+  - type: web
+    name: personal-ai-assistant
+    runtime: node
+    plan: starter # Persistent disks require a paid plan on Render — the free tier does not support them.
+    # region: oregon   # Uncomment and pick the region nearest you; left unset here rather than guessed.
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+
+    disk:
+      name: personal-ai-assistant-data
+      mountPath: /var/data
+      sizeGB: 1 # SQLite + WAL files are a few MB today; 1GB is generous headroom, resizable later in the Render dashboard.
+
+    envVars:
+      # --- Non-secret, safe to set directly in this file ---
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/app.db
+      # Render's own load balancer sits in front of this service and sets
+      # X-Forwarded-For/X-Real-IP correctly (stripping any client-supplied
+      # copy first) — true is the correct, safe setting here specifically
+      # because Render is doing the proxying, not merely present. See the
+      # comment on TRUST_PROXY in src/lib/env.ts for what this protects.
+      - key: TRUST_PROXY
+        value: "true"
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+
+      # --- Secrets: intentionally have NO value here. `sync: false` tells
+      # Render to prompt for each of these in the dashboard at deploy
+      # time (or you set them manually after the first deploy) — their
+      # real values must never be written into this file or committed to
+      # git. See README's "Setup" and "Production Readiness" sections for
+      # what each one is and how to obtain it. ---
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AUTH_USER_EMAIL
+        sync: false
+      - key: AUTH_USER_NAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: APP_ENCRYPTION_KEY
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REDIRECT_URI
+        sync: false
+      - key: MICROSOFT_OAUTH_CLIENT_ID
+        sync: false
+      - key: MICROSOFT_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: MICROSOFT_OAUTH_REDIRECT_URI
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false

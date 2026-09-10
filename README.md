@@ -1189,3 +1189,107 @@ timeouts and the UTC-only briefing date — plus a full regression pass.
   scheduler/cron (still just the documented recommendation above),
   additional Microsoft Graph permissions, LinkedIn automation, Gmail
   sending, always-listening voice — none of these were touched.
+
+## Deploying to Render
+
+The app's architecture — a single long-running Node.js process
+(`next start`) with one local SQLite file — maps directly onto a Render
+**Web Service with a Persistent Disk**, with no code changes: no
+serverless conversion, no database swap. `render.yaml` in the repo root
+is a Blueprint for this; **its exact field names could not be verified
+against Render's live docs from this environment (network egress to
+render.com is blocked here)** — treat it as a strong starting point and
+sanity-check it against Render's current Blueprint spec / dashboard
+during your first sync, not as guaranteed-correct syntax.
+
+### Health check
+
+`GET /api/health` — public (no session required, so Render's health
+checker can reach it), returns `{"status":"ok"}` with a 200 after a
+trivial `SELECT 1` against the database, or `{"status":"unhealthy"}`
+with a 503 if that fails. Never includes a stack trace, file path, or any
+user/secret data on either path.
+
+### Persistent disk / database
+
+Mount a Render Persistent Disk at `/var/data` and set
+`DATABASE_PATH=/var/data/app.db`. No code change was needed for this —
+`db.ts`'s `openDatabase()` already creates its parent directory if
+missing and already runs in WAL mode; both existed before this pass, not
+added for Render specifically. This is deliberately **single-instance**:
+better-sqlite3 is one synchronous, single-writer connection per process,
+so do not add a Render `scaling` block or otherwise run more than one
+instance — this app doesn't need horizontal scaling (it's private/
+single-user) and SQLite doesn't support concurrent writers across
+processes.
+
+### Environment variables
+
+Every variable below is documented in `.env.example` (with the reasoning
+for each OAuth scope) and declared (name only, no value) in
+`render.yaml`'s `envVars` list as `sync: false`, meaning Render prompts
+you to fill in the real value in its dashboard — **none of these values
+belong in `render.yaml`, source code, git, or a `NEXT_PUBLIC_*` variable**:
+
+| Variable | Notes for Render specifically |
+|---|---|
+| `OPENAI_API_KEY` | server-side only |
+| `OPENAI_MODEL` | non-secret, set directly in `render.yaml` |
+| `AUTH_USER_EMAIL`, `AUTH_USER_NAME` | your identity |
+| `ADMIN_PASSWORD` | only used once, by `npm run seed` — see "First deploy" below |
+| `APP_ENCRYPTION_KEY` | `openssl rand -base64 32` |
+| `TRUST_PROXY` | **set to `true` on Render specifically** — Render's own load balancer sets `X-Forwarded-For` correctly, unlike a directly-exposed server |
+| `DATABASE_PATH` | `/var/data/app.db` — must match the disk's `mountPath` |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI` | see OAuth callbacks below |
+| `MICROSOFT_OAUTH_CLIENT_ID`, `MICROSOFT_OAUTH_CLIENT_SECRET`, `MICROSOFT_OAUTH_REDIRECT_URI` | see OAuth callbacks below |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | `npx web-push generate-vapid-keys --json` |
+
+### OAuth callback URLs
+
+Once you know your actual Render hostname (Render assigns one like
+`https://personal-ai-assistant-xxxx.onrender.com`, or your own custom
+domain if you attach one — this repo does not invent or assume that
+hostname anywhere), register exactly:
+
+- Gmail: `https://<your-render-domain>/api/oauth/gmail/callback`
+- Outlook: `https://<your-render-domain>/api/oauth/outlook/callback`
+
+in Google Cloud Console / Azure Portal respectively, matching
+`GOOGLE_OAUTH_REDIRECT_URI` / `MICROSOFT_OAUTH_REDIRECT_URI` exactly.
+
+### Web Push in production
+
+Unchanged behavior, confirmed HTTPS-compatible: `VAPID_PUBLIC_KEY` is
+meant to be client-visible (sent to the browser's `PushManager.subscribe()`
+call — see `/api/push/config`, which only ever returns the public key,
+never the private one); `VAPID_PRIVATE_KEY` is read in exactly one place
+(`push.ts`'s server-only `setVapidDetails` call) and never appears in any
+API response. Render serves everything over HTTPS by default, which is a
+hard requirement for `PushManager.subscribe()` outside `localhost`.
+
+### Scheduler
+
+Still not implemented, as instructed — `generateDailyBriefing(userId)`
+remains a plain callable function with no timer of any kind wired to it.
+Once the web service is running on Render, the natural next step is a
+Render **Cron Job** (a separate resource from the web service, on the
+same persistent disk / database) hitting a new authenticated endpoint
+that calls it. Not built this pass.
+
+### First deploy checklist
+
+1. Push this branch (already done) and create the Blueprint / Web
+   Service in Render pointing at this repo.
+2. Fill in every `sync: false` variable in the Render dashboard before
+   the first successful boot (`OPENAI_API_KEY` and `APP_ENCRYPTION_KEY`
+   at minimum — Gmail/Outlook/VAPID vars can be added later, the app
+   honestly reports those features as "not connected"/unconfigured
+   without them, per "What is intentionally NOT faked" above).
+3. After the first deploy, run `npm run seed` **in a Render shell against
+   that same instance** (so it writes to the persistent disk, not a local
+   throwaway) with `ADMIN_PASSWORD` set, to create your owner account.
+4. Register the two OAuth callback URLs above once you know your Render
+   hostname.
+5. Log in, confirm `/api/health` is green in the Render dashboard, then
+   work through the manual Gmail/Outlook/iPhone checklists earlier in
+   this README with your real, deployed URL.
