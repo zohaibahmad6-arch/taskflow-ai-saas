@@ -3,6 +3,7 @@ import { db, newId } from "./db";
 
 export type AuditEventType =
   | "proposed"
+  | "edited"
   | "approved"
   | "rejected"
   | "executed"

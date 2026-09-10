@@ -13,6 +13,6 @@ export async function POST(req: NextRequest) {
   const parsed = schema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: "Invalid request." }, { status: 400 });
 
-  removeSubscription(parsed.data.endpoint);
+  removeSubscription(session.user.id, parsed.data.endpoint);
   return NextResponse.json({ ok: true });
 }

@@ -26,8 +26,16 @@ export function saveSubscription(userId: string, sub: PushSubscriptionInput): vo
   ).run(newId("push"), userId, sub.endpoint, JSON.stringify(sub.keys));
 }
 
-export function removeSubscription(endpoint: string): void {
-  db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint);
+/**
+ * Scoped to the owning user as well as the endpoint — never trust an
+ * endpoint alone to identify "the caller's own" subscription, even
+ * though this is a single-user app today.
+ */
+export function removeSubscription(userId: string, endpoint: string): void {
+  db.prepare("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?").run(
+    userId,
+    endpoint
+  );
 }
 
 export function hasPushSubscription(userId: string): boolean {
@@ -68,7 +76,7 @@ export async function notifyUser(
       } catch (err: unknown) {
         const statusCode = (err as { statusCode?: number })?.statusCode;
         if (statusCode === 404 || statusCode === 410) {
-          removeSubscription(sub.endpoint);
+          removeSubscription(userId, sub.endpoint);
         }
       }
     })

@@ -11,15 +11,23 @@ branding, or infrastructure with any other app.
 
 - **Authentication** — single owner account, bcrypt-hashed password, httpOnly
   signed session cookies validated against the DB on every request, CSRF
-  double-submit protection on all mutating requests, rate-limited login.
+  double-submit protection on all mutating requests, rate-limited login
+  (rate limiting only trusts `X-Forwarded-For` when `TRUST_PROXY=true` — see
+  `.env.example`). Changing your password immediately revokes every other
+  active session; "Sign out other devices" is also available anytime from
+  Settings → Security.
 - **AI Chat** — full tool-calling loop against the OpenAI API. Conversation
   history is persisted per-conversation.
 - **Approval Center** — every external/irreversible action (send email,
   publish a post) is server-side classified and *must* go through here.
-  Approving/rejecting/expiring is enforced in the backend, not just the UI;
-  there is no code path that lets a tool skip it. Each action has a unique
-  id (idempotent — re-approving or re-executing is a no-op, never a
-  duplicate send). Approvals expire automatically (24h) if ignored.
+  The approval's `payload` is the single authoritative source for what
+  executes — editing it in the UI genuinely changes what will be sent, not
+  just what's displayed, and a fresh explicit approval is required against
+  whatever payload is current (an edit invalidates any decision already in
+  flight against the pre-edit version — enforced via a revision number, not
+  trust). Each action has a unique id (idempotent — re-approving or
+  re-executing is a no-op, never a duplicate send). Approvals expire
+  automatically (24h) if ignored, and edits reset that window.
 - **Activity / audit log** — every proposal, approval, rejection, execution,
   and failure is recorded with a timestamp. No secrets are ever written to
   it.
@@ -63,11 +71,17 @@ src/lib/tools/           Tool registry: every tool declares
                           EXTERNAL_ACTION tools are structurally incapable
                           of running their side effect outside the
                           Approval Center (see tools/execute.ts).
-src/lib/approvals.ts     Approval Center backend: create/decide/execute,
-                          expiration, idempotent execution.
+src/lib/approvals.ts     Approval Center backend: create/edit/decide/execute,
+                          revision-based optimistic concurrency, expiration,
+                          idempotent execution. Always reads the payload
+                          fresh from the DB at execution time — never a
+                          value passed in by a caller.
 src/lib/audit.ts         Append-only audit log.
 src/lib/ai/chat.ts       OpenAI tool-calling loop.
-src/lib/auth.ts          Session + CSRF.
+src/lib/auth.ts          Cookie-based session/CSRF wrapper around sessions.ts.
+src/lib/sessions.ts      Pure, DB-backed session storage (no cookies) —
+                          separated out so it's unit-testable and so
+                          revocation logic lives in one place.
 src/lib/crypto.ts        AES-256-GCM helpers for encrypting OAuth tokens
                           at rest (ready for when real providers are wired
                           up).
@@ -101,10 +115,11 @@ install code itself — that's a development task, by design.
    - `OPENAI_API_KEY` — your OpenAI key (never exposed to the browser).
    - `AUTH_USER_EMAIL` / `AUTH_USER_NAME` — your identity.
    - `ADMIN_PASSWORD` — used once by the seed script, not stored.
-   - `SESSION_SECRET` — `openssl rand -base64 48`
    - `APP_ENCRYPTION_KEY` — `openssl rand -base64 32`
    - `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` — optional, for push
      notifications: `npx web-push generate-vapid-keys --json`
+   - `TRUST_PROXY` — leave `false` unless deployed behind a reverse proxy
+     that overwrites `X-Forwarded-For`/`X-Real-IP` (see `.env.example`).
 
 3. **Create your account**
    ```bash
@@ -118,7 +133,17 @@ install code itself — that's a development task, by design.
    Open on your iPhone (same network) or `localhost:3000`, and use Safari's
    Share → Add to Home Screen to install it as an app.
 
-5. **Production build**
+5. **Run the test suite**
+   ```bash
+   npm test
+   ```
+   Unit/regression tests for the security-critical paths (Approval Center
+   edit integrity, session revocation, tool input limits, defensive tool
+   registration, push subscription ownership, timing-safe comparison,
+   trusted-proxy IP resolution). Uses an isolated SQLite file at
+   `./data/test.db`, never your real `./data/app.db`.
+
+6. **Production build**
    ```bash
    npm run build && npm start
    ```
@@ -127,7 +152,8 @@ install code itself — that's a development task, by design.
 
 ## Verified before calling this done
 
-- `npm run build` and `npm run lint` both pass clean.
+- `npm run build`, `npm run lint`, and `npm audit` all pass clean (0
+  vulnerabilities). `npm test` passes 42/42.
 - Manually verified via HTTP: login/logout, CSRF rejection on a mutating
   request without the token, unauthenticated requests get 401, an
   approved `EXTERNAL_ACTION` with no connected provider fails safely

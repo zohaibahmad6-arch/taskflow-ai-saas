@@ -2,8 +2,9 @@ import "server-only";
 import { db, newId, nowIso } from "./db";
 import { writeAuditEvent } from "./audit";
 import { getTool } from "./tools/registry";
+import { ensureToolsRegistered } from "./tools";
 import { notifyUser } from "./push";
-import type { ApprovalDraft } from "./tools/types";
+import type { ApprovalDraftText } from "./tools/types";
 
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -24,21 +25,27 @@ export type ApprovalRow = {
   target: string;
   content: string;
   consequence: string;
-  input_json: string;
+  payload_json: string;
+  revision: number;
   status: ApprovalStatus;
   requested_at: string;
   expires_at: string;
+  edited_at: string | null;
   decided_at: string | null;
   executed_at: string | null;
   result_json: string | null;
   error: string | null;
 };
 
+export class ApprovalRevisionMismatchError extends Error {}
+export class ApprovalStateError extends Error {}
+export class ApprovalNotFoundError extends Error {}
+
 export function createApproval(params: {
   userId: string;
   toolId: string;
-  input: unknown;
-  draft: ApprovalDraft;
+  payload: unknown;
+  draftText: ApprovalDraftText;
   ttlMs?: number;
 }): ApprovalRow {
   const id = newId("appr");
@@ -46,18 +53,18 @@ export function createApproval(params: {
   const expiresAt = new Date(Date.now() + (params.ttlMs ?? DEFAULT_TTL_MS)).toISOString();
 
   db.prepare(
-    `INSERT INTO approvals (id, action_id, user_id, tool_id, action, target, content, consequence, input_json, expires_at)
+    `INSERT INTO approvals (id, action_id, user_id, tool_id, action, target, content, consequence, payload_json, expires_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     actionId,
     params.userId,
     params.toolId,
-    params.draft.action,
-    params.draft.target,
-    params.draft.content,
-    params.draft.consequence,
-    JSON.stringify(params.input),
+    params.draftText.action,
+    params.draftText.target,
+    params.draftText.content,
+    params.draftText.consequence,
+    JSON.stringify(params.payload),
     expiresAt
   );
 
@@ -66,15 +73,15 @@ export function createApproval(params: {
     toolId: params.toolId,
     actionId,
     eventType: "proposed",
-    summary: `Prepared: ${params.draft.action} → ${params.draft.target}`,
-    target: params.draft.target,
-    detail: { content: params.draft.content, consequence: params.draft.consequence },
+    summary: `Prepared: ${params.draftText.action} → ${params.draftText.target}`,
+    target: params.draftText.target,
+    detail: { content: params.draftText.content, consequence: params.draftText.consequence },
   });
 
   // Best-effort, non-blocking: a notification failure must never affect the approval itself.
   void notifyUser(params.userId, {
     title: "Action awaiting your approval",
-    body: `${params.draft.action} → ${params.draft.target}`,
+    body: `${params.draftText.action} → ${params.draftText.target}`,
     url: "/approvals",
   }).catch(() => {});
 
@@ -122,34 +129,123 @@ export function expireStaleApprovals(userId: string): void {
 }
 
 /**
+ * Edits the payload of a pending approval in place. This is the ONLY way
+ * an approval's content can change after creation, and it is only ever
+ * possible while status === 'pending' — an approved or executed approval
+ * is immutable (test requirement C). The merged payload is re-validated
+ * against the tool's own approvalPayloadSchema (never trusted as-is), the
+ * display text is recomputed from it via describePayload so it can never
+ * drift from what will execute, and `revision` is bumped so any decision
+ * already in flight against the pre-edit state is invalidated (see
+ * decideApproval's expectedRevision check).
+ */
+export async function editApproval(
+  userId: string,
+  approvalId: string,
+  partialPayload: Record<string, unknown>
+): Promise<ApprovalRow> {
+  ensureToolsRegistered();
+
+  const row = getApprovalById(approvalId);
+  if (!row || row.user_id !== userId) {
+    throw new ApprovalNotFoundError("Approval not found.");
+  }
+  if (row.status !== "pending") {
+    throw new ApprovalStateError(
+      `Cannot edit an approval that is already ${row.status}. Only pending approvals can be edited.`
+    );
+  }
+
+  const tool = getTool(row.tool_id);
+  if (!tool || tool.permissionLevel !== "EXTERNAL_ACTION" || !tool.approvalPayloadSchema || !tool.describePayload) {
+    throw new ApprovalStateError(`Tool "${row.tool_id}" cannot be edited.`);
+  }
+
+  const currentPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
+  const merged = { ...currentPayload, ...partialPayload };
+
+  const parsed = tool.approvalPayloadSchema.safeParse(merged);
+  if (!parsed.success) {
+    throw new ApprovalStateError(
+      `Invalid edit: ${parsed.error.issues.map((i) => i.message).join("; ")}`
+    );
+  }
+
+  const draftText = await tool.describePayload(parsed.data, { userId });
+  const expiresAt = new Date(Date.now() + DEFAULT_TTL_MS).toISOString();
+
+  db.prepare(
+    `UPDATE approvals SET
+       payload_json = ?, action = ?, target = ?, content = ?, consequence = ?,
+       revision = revision + 1, edited_at = ?, expires_at = ?
+     WHERE id = ?`
+  ).run(
+    JSON.stringify(parsed.data),
+    draftText.action,
+    draftText.target,
+    draftText.content,
+    draftText.consequence,
+    nowIso(),
+    expiresAt,
+    row.id
+  );
+
+  const updated = getApprovalById(approvalId)!;
+
+  writeAuditEvent({
+    userId,
+    toolId: row.tool_id,
+    actionId: row.action_id,
+    eventType: "edited",
+    summary: `Edited: ${draftText.action} → ${draftText.target} (revision ${updated.revision})`,
+    target: draftText.target,
+    detail: { payload: parsed.data },
+  });
+
+  return updated;
+}
+
+/**
  * The only place in the codebase allowed to reject/approve an approval.
  * Never call this from anywhere that isn't the explicit, user-initiated
  * Approval Center endpoint — viewing or listing an approval must never
  * reach this function.
+ *
+ * `expectedRevision` implements optimistic concurrency: the caller must
+ * pass the revision it last saw. If the approval was edited since (by
+ * this user in another tab, or in principle by any other path) the
+ * revision will have moved on and this throws instead of silently
+ * deciding on a payload the caller never actually reviewed — this is
+ * what makes edits to the target/recipient/content "invalidate" a
+ * decision that was formed against the pre-edit state (test requirements
+ * D and E), without needing a separate invalidation flag.
  */
 export async function decideApproval(
   userId: string,
   approvalId: string,
   decision: "approved" | "rejected",
-  editedContent?: string
+  expectedRevision: number
 ): Promise<ApprovalRow> {
   const row = getApprovalById(approvalId);
   if (!row || row.user_id !== userId) {
-    throw new Error("Approval not found.");
+    throw new ApprovalNotFoundError("Approval not found.");
   }
   if (row.status !== "pending") {
-    throw new Error(`Approval is already ${row.status}; it cannot be decided again.`);
+    throw new ApprovalStateError(`Approval is already ${row.status}; it cannot be decided again.`);
   }
   if (new Date(row.expires_at).getTime() < Date.now()) {
     db.prepare("UPDATE approvals SET status = 'expired' WHERE id = ?").run(row.id);
-    throw new Error("This approval has expired. Ask the assistant to prepare it again.");
+    throw new ApprovalStateError("This approval has expired. Ask the assistant to prepare it again.");
+  }
+  if (row.revision !== expectedRevision) {
+    throw new ApprovalRevisionMismatchError(
+      "This approval has changed since you last viewed it (it was edited). Refresh and review the latest version before deciding."
+    );
   }
 
-  const content = editedContent !== undefined ? editedContent : row.content;
-
   db.prepare(
-    "UPDATE approvals SET status = ?, decided_at = ?, content = ? WHERE id = ?"
-  ).run(decision, nowIso(), content, row.id);
+    "UPDATE approvals SET status = ?, decided_at = ? WHERE id = ?"
+  ).run(decision, nowIso(), row.id);
 
   writeAuditEvent({
     userId,
@@ -158,7 +254,6 @@ export async function decideApproval(
     eventType: decision,
     summary: `User ${decision === "approved" ? "approved" : "rejected"}: ${row.action} → ${row.target}`,
     target: row.target,
-    detail: editedContent !== undefined ? { editedContent } : undefined,
   });
 
   const updated = getApprovalById(approvalId)!;
@@ -170,18 +265,28 @@ export async function decideApproval(
 }
 
 /**
- * Executes an approved action exactly once. Idempotent: if called again
- * (e.g. a duplicate request) on an approval that is already executed or
- * failed, it returns the existing recorded result instead of re-running
- * the side effect.
+ * Executes an approved action exactly once, reading the payload fresh
+ * from the DB (never a value passed in by a caller), so it is physically
+ * impossible for this to execute anything other than the approval's
+ * current, final, reviewed payload. Idempotent: if called again (e.g. a
+ * duplicate request) on an approval that is already executed or failed,
+ * it returns the existing recorded result instead of re-running the side
+ * effect.
+ *
+ * Defensively re-registers tools on every call rather than assuming some
+ * earlier page render already did it — this must behave correctly as the
+ * very first thing that runs in a fresh server process (e.g. a
+ * serverless cold start hitting the approval endpoint directly).
  */
 export async function executeApproval(
   userId: string,
   approvalId: string
 ): Promise<ApprovalRow> {
+  ensureToolsRegistered();
+
   const row = getApprovalById(approvalId);
   if (!row || row.user_id !== userId) {
-    throw new Error("Approval not found.");
+    throw new ApprovalNotFoundError("Approval not found.");
   }
 
   if (row.status === "executed" || row.status === "failed") {
@@ -189,7 +294,7 @@ export async function executeApproval(
   }
 
   if (row.status !== "approved") {
-    throw new Error(`Cannot execute an approval in status "${row.status}".`);
+    throw new ApprovalStateError(`Cannot execute an approval in status "${row.status}".`);
   }
 
   const tool = getTool(row.tool_id);
@@ -211,8 +316,8 @@ export async function executeApproval(
   }
 
   try {
-    const input = JSON.parse(row.input_json);
-    const result = await tool.execute(input, { userId });
+    const payload = JSON.parse(row.payload_json);
+    const result = await tool.execute(payload, { userId });
     db.prepare(
       "UPDATE approvals SET status = 'executed', executed_at = ?, result_json = ? WHERE id = ?"
     ).run(nowIso(), JSON.stringify(result.output), row.id);

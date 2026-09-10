@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS social_drafts (
 -- The Approval Center. Every EXTERNAL_ACTION tool call creates exactly one
 -- row here before anything external can happen, and execution is only ever
 -- triggered from the approve endpoint after status = 'approved'.
+--
+-- payload_json is the SOLE authoritative, structured input that execution
+-- reads from — never a separate/original copy. action/target/content/
+-- consequence are display text derived FROM payload_json (via a tool's
+-- describePayload) and are recomputed every time payload_json changes, so
+-- they can never drift from what will actually execute. `revision` is
+-- bumped on every edit and must be echoed back by the decide endpoint
+-- (optimistic concurrency), so approving cannot silently act on a payload
+-- older than the one the user last reviewed.
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
   action_id TEXT NOT NULL UNIQUE, -- idempotency key
@@ -89,10 +98,12 @@ CREATE TABLE IF NOT EXISTS approvals (
   target TEXT NOT NULL,
   content TEXT NOT NULL,
   consequence TEXT NOT NULL,
-  input_json TEXT NOT NULL DEFAULT '{}',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  revision INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|expired|executed|failed
   requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   expires_at TEXT NOT NULL,
+  edited_at TEXT,
   decided_at TEXT,
   executed_at TEXT,
   result_json TEXT,

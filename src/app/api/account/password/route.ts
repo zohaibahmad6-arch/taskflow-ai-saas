@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
-import { getSession, hashPassword } from "@/lib/auth";
+import { getSession, hashPassword, revokeOtherSessions } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { writeAuditEvent } from "@/lib/audit";
@@ -44,12 +44,23 @@ export async function POST(req: NextRequest) {
   const newHash = await hashPassword(parsed.data.newPassword);
   db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(newHash, session.user.id);
 
+  // A password change is often a direct response to a suspected
+  // compromise — an old session cookie must not remain valid for up to
+  // 30 more days just because the browser that holds it wasn't the one
+  // used to change the password. The current session is kept active
+  // (the user making this change stays logged in); every other session
+  // is deleted immediately and fails on its very next request.
+  const revokedCount = revokeOtherSessions(session.user.id, session.sessionId);
+
   writeAuditEvent({
     userId: session.user.id,
     toolId: "system.account",
     eventType: "info",
-    summary: "Password changed.",
+    summary:
+      revokedCount > 0
+        ? `Password changed. Signed out ${revokedCount} other session(s).`
+        : "Password changed.",
   });
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, revokedSessions: revokedCount });
 }

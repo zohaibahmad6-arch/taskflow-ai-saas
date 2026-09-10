@@ -15,12 +15,13 @@ export type ToolCategory =
   | "automation"
   | "system";
 
-export type ApprovalDraft = {
-  /** Human-readable description of exactly what the agent wants to do. */
+/** Human-readable text shown in the Approval Center, derived FROM a payload. */
+export type ApprovalDraftText = {
+  /** What the agent wants to do. */
   action: string;
   /** Who/what will receive the action (e.g. "LinkedIn", "jane@company.com"). */
   target: string;
-  /** Exactly what will be sent/published. */
+  /** Exactly what will be sent/published — must match `content` inside the payload. */
   content: string;
   /** Plain-language explanation of what will happen if approved. */
   consequence: string;
@@ -37,7 +38,7 @@ export type ToolResult = {
   awaitingApproval?: boolean;
 };
 
-export type ToolDefinition<TInput = unknown> = {
+export type ToolDefinition<TInput = unknown, TPayload = TInput> = {
   id: string;
   name: string;
   description: string;
@@ -45,20 +46,39 @@ export type ToolDefinition<TInput = unknown> = {
   permissionLevel: ToolPermissionLevel;
   inputSchema: ZodTypeAny;
   /**
-   * For READ_ONLY / PREPARATION tools: performs the work directly.
-   * For EXTERNAL_ACTION tools: this is the PREVIEW step — it must not
-   * perform the side effect. It returns the approval draft that will be
-   * shown to the user; the actual side effect lives in `execute` below.
+   * READ_ONLY / PREPARATION only: performs the work directly. Required
+   * for those two levels; never called for EXTERNAL_ACTION tools.
    */
-  run: (input: TInput, ctx: ToolContext) => Promise<ToolResult>;
+  run?: (input: TInput, ctx: ToolContext) => Promise<ToolResult>;
+
   /**
-   * EXTERNAL_ACTION tools only: builds the exact Approval Center draft
-   * for this call. Required whenever permissionLevel is EXTERNAL_ACTION.
+   * EXTERNAL_ACTION only, all four required. Together these guarantee the
+   * Approval Center never executes anything but the payload the user
+   * actually reviewed:
+   *
+   *  - approvalPayloadSchema: the schema of the STORED, EDITABLE,
+   *    EXECUTED payload. This is the single source of truth from the
+   *    moment the approval is created — editing rewrites this payload in
+   *    place (validated against this same schema); execute() is only
+   *    ever given a value that has passed this schema.
+   *  - resolvePayload: turns the tool's initial call arguments (which may
+   *    reference something external, e.g. a draft id) into the first
+   *    payload snapshot. Called once, at approval-creation time.
+   *  - describePayload: pure derivation of display text FROM a payload.
+   *    Called both at creation and after every edit, so the shown
+   *    action/target/content/consequence can never drift from the
+   *    payload that will actually execute.
+   *  - execute: performs the real side effect using ONLY the payload
+   *    passed in — must never re-fetch or re-derive content from
+   *    wherever it originally came from (e.g. a drafts table), since
+   *    that source may have changed or may not reflect an edit made in
+   *    the Approval Center.
    */
-  buildApprovalDraft?: (input: TInput, ctx: ToolContext) => Promise<ApprovalDraft>;
-  /**
-   * EXTERNAL_ACTION tools only: performs the actual side effect. Called
-   * ONLY by the approval-execution path, only after status === 'approved'.
-   */
-  execute?: (input: TInput, ctx: ToolContext) => Promise<ToolResult>;
+  approvalPayloadSchema?: ZodTypeAny;
+  resolvePayload?: (input: TInput, ctx: ToolContext) => Promise<TPayload>;
+  describePayload?: (payload: TPayload, ctx: ToolContext) => Promise<ApprovalDraftText>;
+  execute?: (payload: TPayload, ctx: ToolContext) => Promise<ToolResult>;
+
+  /** Optional short hint shown in the edit UI, e.g. "Fields: to, subject, body". */
+  payloadHint?: string;
 };

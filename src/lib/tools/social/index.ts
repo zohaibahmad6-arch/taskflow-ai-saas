@@ -7,6 +7,7 @@ import { getPreferences, describePreferencesForPrompt } from "../../preferences"
 import { createSocialDraft, getSocialDraft } from "../../socialDrafts";
 
 const PLATFORMS = ["linkedin", "x", "facebook", "instagram"] as const;
+const MAX_POST_LENGTH = 10_000; // generous upper bound; real platform limits are enforced by the platform itself
 
 const checkConnectionTool: ToolDefinition<Record<string, never>> = {
   id: "social.checkConnection",
@@ -27,8 +28,8 @@ const checkConnectionTool: ToolDefinition<Record<string, never>> = {
 
 const createPostInput = z.object({
   platform: z.enum(PLATFORMS).describe("Target platform for the post."),
-  topic: z.string().describe("What the post should be about."),
-  notes: z.string().optional().describe("Extra guidance for this specific post."),
+  topic: z.string().min(1).max(2_000).describe("What the post should be about."),
+  notes: z.string().max(2_000).optional().describe("Extra guidance for this specific post."),
 });
 
 const createPostTool: ToolDefinition<z.infer<typeof createPostInput>> = {
@@ -68,10 +69,12 @@ const createPostTool: ToolDefinition<z.infer<typeof createPostInput>> = {
 };
 
 const rewritePostInput = z.object({
-  content: z.string().describe("The existing post text to rewrite."),
+  content: z.string().min(1).max(MAX_POST_LENGTH).describe("The existing post text to rewrite."),
   platform: z.enum(PLATFORMS).describe("Platform to adapt the post for."),
   instruction: z
     .string()
+    .min(1)
+    .max(500)
     .describe("How to change it, e.g. 'shorten', 'expand', 'make it punchier', 'adapt for X from a LinkedIn post'."),
 });
 
@@ -109,43 +112,59 @@ const rewritePostTool: ToolDefinition<z.infer<typeof rewritePostInput>> = {
   },
 };
 
+// What the AI passes when it asks to publish — just a reference to an
+// existing draft.
 const publishPostInput = z.object({
-  draftId: z.string().describe("The id of a previously created draft to publish."),
+  draftId: z.string().min(1).max(100).describe("The id of a previously created draft to publish."),
 });
 
-const publishPostTool: ToolDefinition<z.infer<typeof publishPostInput>> = {
+// What actually gets stored on the Approval, edited, and executed. Built
+// once (a snapshot) by resolvePayload below, and from then on is the
+// ONLY thing execute() reads — the drafts table is never re-read to
+// decide what gets published, so an edit made in the Approval Center (or
+// a change to the source draft after the approval was created) can never
+// cause a mismatch between what was reviewed and what executes.
+const publishPostPayload = z.object({
+  platform: z.enum(PLATFORMS),
+  content: z.string().min(1).max(MAX_POST_LENGTH),
+  draftId: z.string().max(100).optional(), // kept only for bookkeeping (marking the source draft published)
+});
+
+const publishPostTool: ToolDefinition<z.infer<typeof publishPostInput>, z.infer<typeof publishPostPayload>> = {
   id: "social.publishPost",
   name: "Publish Social Post",
   description: "Publishes a draft post to its platform. External, irreversible, and always requires explicit user approval.",
   category: "social",
   permissionLevel: "EXTERNAL_ACTION",
   inputSchema: publishPostInput,
-  run: async () => {
-    throw new Error("social.publishPost has no direct run(); it must go through the approval flow.");
-  },
-  buildApprovalDraft: async (input) => {
+  payloadHint: "Fields: platform, content",
+  approvalPayloadSchema: publishPostPayload,
+  resolvePayload: async (input) => {
     const draft = getSocialDraft(input.draftId);
     if (!draft) throw new Error("Draft not found.");
-    return {
-      action: "Publish social post",
-      target: draft.platform,
-      content: draft.content,
-      consequence: `This will publish the post publicly to your ${draft.platform} account immediately. This cannot be undone.`,
-    };
+    return { platform: draft.platform as (typeof PLATFORMS)[number], content: draft.content, draftId: draft.id };
   },
-  execute: async (input, ctx) => {
-    const draft = getSocialDraft(input.draftId);
-    if (!draft) throw new Error("Draft not found.");
-    if (!isConnected(ctx.userId, draft.platform)) {
+  describePayload: async (payload) => ({
+    action: "Publish social post",
+    target: payload.platform,
+    content: payload.content,
+    consequence: `This will publish the post publicly to your ${payload.platform} account immediately. This cannot be undone.`,
+  }),
+  execute: async (payload, ctx) => {
+    if (!isConnected(ctx.userId, payload.platform)) {
       throw new Error(
-        `${draft.platform} is not connected. Connect it from Settings → Connected Services, then approve this action again.`
+        `${payload.platform} is not connected. Connect it from Settings → Connected Services, then approve this action again.`
       );
     }
-    // A real platform integration would call the publish API here. None is
-    // wired up in this build, so we deliberately fail rather than pretend
-    // the post went out.
+    // A real platform integration would call the publish API here, using
+    // payload.content exactly as approved (which may differ from the
+    // source draft's current text if it was edited in the Approval
+    // Center) — never re-reading the draft. On success it should also
+    // mark the source draft published via updateSocialDraftStatus. None
+    // of that is wired up in this build, so we deliberately fail rather
+    // than pretend the post went out.
     throw new Error(
-      `${draft.platform} is marked connected, but no publish integration is implemented yet in this build.`
+      `${payload.platform} is marked connected, but no publish integration is implemented yet in this build.`
     );
   },
 };

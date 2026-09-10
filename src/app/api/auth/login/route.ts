@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyLogin, createSession } from "@/lib/auth";
 import { checkRateLimit } from "@/lib/rateLimit";
+import { getClientIp } from "@/lib/clientIp";
+import { env } from "@/lib/env";
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -9,7 +11,7 @@ const loginSchema = z.object({
 });
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for") ?? "local";
+  const ip = getClientIp(req.headers, env.trustProxy);
   const rate = checkRateLimit({ bucket: `login:${ip}`, limit: 8, windowMs: 5 * 60 * 1000 });
   if (!rate.allowed) {
     return NextResponse.json(

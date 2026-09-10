@@ -30,9 +30,6 @@ export const env = {
   get authUserName() {
     return optional("AUTH_USER_NAME", "Owner");
   },
-  get sessionSecret() {
-    return required("SESSION_SECRET");
-  },
   get appEncryptionKey() {
     return required("APP_ENCRYPTION_KEY");
   },
@@ -50,6 +47,20 @@ export const env = {
   },
   get pushConfigured() {
     return Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+  },
+  /**
+   * Whether this deployment sits behind a reverse proxy/load balancer that
+   * can be trusted to set (and strip any client-supplied copy of)
+   * X-Forwarded-For / X-Real-IP before requests reach this app. Defaults
+   * to false: a directly-exposed Next.js server must NOT trust those
+   * headers, since any client can set them to whatever they like and
+   * would otherwise be able to spread requests across fake IPs to defeat
+   * per-IP rate limiting. Only set TRUST_PROXY=true if you know your
+   * hosting setup (e.g. Vercel, or nginx/Cloudflare configured to
+   * overwrite these headers) guarantees that.
+   */
+  get trustProxy() {
+    return optional("TRUST_PROXY", "false").toLowerCase() === "true";
   },
   get nodeEnv() {
     return optional("NODE_ENV", "development");

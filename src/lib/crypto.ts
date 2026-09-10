@@ -45,9 +45,18 @@ export function randomToken(bytes = 32): string {
   return crypto.randomBytes(bytes).toString("base64url");
 }
 
+/**
+ * Constant-time string comparison for secrets (CSRF tokens, etc). Hashes
+ * both sides first rather than comparing raw bytes: `crypto.timingSafeEqual`
+ * throws on a length mismatch, so a naive implementation has to check
+ * lengths before calling it — and that early-return branches in variable
+ * time depending on input length, leaking the secret's length via timing.
+ * Since SHA-256 always produces a fixed 32-byte digest, comparing digests
+ * needs no length branch at all: this function takes the same code path
+ * regardless of how long `a` and `b` are or how much they differ.
+ */
 export function timingSafeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+  const hashA = crypto.createHash("sha256").update(a, "utf-8").digest();
+  const hashB = crypto.createHash("sha256").update(b, "utf-8").digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }

@@ -8,20 +8,47 @@ declare global {
   var __personalAgentDb: Database.Database | undefined;
 }
 
+/**
+ * Best-effort permission hardening — this holds private personal data
+ * (email drafts, approvals, audit history) and should be owner-read/write
+ * only. Wrapped in try/catch because chmod semantics vary by platform
+ * (notably Windows, and some network/container filesystems don't support
+ * POSIX modes at all): failing to tighten permissions there must never
+ * block the app from starting.
+ */
+function chmodIfExists(targetPath: string, mode: number): void {
+  try {
+    if (fs.existsSync(targetPath)) {
+      fs.chmodSync(targetPath, mode);
+    }
+  } catch {
+    // Unsupported on this filesystem/platform — not fatal.
+  }
+}
+
 function openDatabase(): Database.Database {
   const dbPath = env.databasePath;
   const dir = path.dirname(dbPath);
   if (dir && dir !== "." && !fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  chmodIfExists(dir, 0o700);
 
   const db = new Database(dbPath);
+  chmodIfExists(dbPath, 0o600);
+
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
 
   const schemaPath = path.join(process.cwd(), "src", "lib", "schema.sql");
   const schema = fs.readFileSync(schemaPath, "utf-8");
   db.exec(schema);
+
+  // WAL mode creates -wal/-shm sidecar files on first write (the schema
+  // exec above), which also hold live data — restrict those too.
+  chmodIfExists(dbPath, 0o600);
+  chmodIfExists(`${dbPath}-wal`, 0o600);
+  chmodIfExists(`${dbPath}-shm`, 0o600);
 
   return db;
 }

@@ -2,32 +2,28 @@ import "server-only";
 import { cookies } from "next/headers";
 import bcrypt from "bcryptjs";
 import { db, newId } from "./db";
-import { randomToken, sha256Hex, timingSafeEqual } from "./crypto";
+import { timingSafeEqual } from "./crypto";
 import { env } from "./env";
+import {
+  createSessionRecord,
+  getSessionByToken,
+  deleteSessionByToken,
+  revokeOtherSessions,
+  type SessionUser,
+  type StoredSession,
+} from "./sessions";
+
+export { revokeOtherSessions };
+export type { SessionUser };
 
 export const SESSION_COOKIE = "pa_session";
 export const CSRF_COOKIE = "pa_csrf";
-const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-export type SessionUser = {
-  id: string;
-  email: string;
-  name: string;
-};
 
 type UserRow = {
   id: string;
   email: string;
   name: string;
   password_hash: string;
-};
-
-type SessionRow = {
-  id: string;
-  user_id: string;
-  token_hash: string;
-  csrf_secret: string;
-  expires_at: string;
 };
 
 /** Ensures the single authorized user row exists, matching AUTH_USER_EMAIL. */
@@ -72,30 +68,22 @@ export async function createSession(
   userId: string,
   userAgent: string | null
 ): Promise<void> {
-  const token = randomToken(32);
-  const csrfSecret = randomToken(24);
-  const tokenHash = sha256Hex(token);
-  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
-
-  db.prepare(
-    `INSERT INTO sessions (id, user_id, token_hash, csrf_secret, user_agent, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(newId("sess"), userId, tokenHash, csrfSecret, userAgent, expiresAt);
+  const rec = createSessionRecord(userId, userAgent);
 
   const store = await cookies();
-  store.set(SESSION_COOKIE, token, {
+  store.set(SESSION_COOKIE, rec.token, {
     httpOnly: true,
     secure: env.isProduction,
     sameSite: "lax",
     path: "/",
-    expires: new Date(expiresAt),
+    expires: new Date(rec.expiresAt),
   });
-  store.set(CSRF_COOKIE, csrfSecret, {
+  store.set(CSRF_COOKIE, rec.csrfSecret, {
     httpOnly: false,
     secure: env.isProduction,
     sameSite: "lax",
     path: "/",
-    expires: new Date(expiresAt),
+    expires: new Date(rec.expiresAt),
   });
 }
 
@@ -103,38 +91,17 @@ export async function destroySession(): Promise<void> {
   const store = await cookies();
   const token = store.get(SESSION_COOKIE)?.value;
   if (token) {
-    const tokenHash = sha256Hex(token);
-    db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
+    deleteSessionByToken(token);
   }
   store.delete(SESSION_COOKIE);
   store.delete(CSRF_COOKIE);
 }
 
-export async function getSession(): Promise<{
-  user: SessionUser;
-  csrfSecret: string;
-} | null> {
+export async function getSession(): Promise<StoredSession | null> {
   const store = await cookies();
   const token = store.get(SESSION_COOKIE)?.value;
   if (!token) return null;
-
-  const tokenHash = sha256Hex(token);
-  const session = db
-    .prepare("SELECT * FROM sessions WHERE token_hash = ?")
-    .get(tokenHash) as SessionRow | undefined;
-  if (!session) return null;
-
-  if (new Date(session.expires_at).getTime() < Date.now()) {
-    db.prepare("DELETE FROM sessions WHERE id = ?").run(session.id);
-    return null;
-  }
-
-  const user = db
-    .prepare("SELECT id, email, name FROM users WHERE id = ?")
-    .get(session.user_id) as SessionUser | undefined;
-  if (!user) return null;
-
-  return { user, csrfSecret: session.csrf_secret };
+  return getSessionByToken(token);
 }
 
 /**

@@ -5,7 +5,11 @@ import { db, newId } from "../../db";
 import { generateText } from "../../openai";
 
 const proposeCapabilityInput = z.object({
-  request: z.string().describe("What the user wants the assistant to be able to do, in their own words."),
+  request: z
+    .string()
+    .min(1)
+    .max(4_000)
+    .describe("What the user wants the assistant to be able to do, in their own words."),
 });
 
 const proposeCapabilityTool: ToolDefinition<z.infer<typeof proposeCapabilityInput>> = {

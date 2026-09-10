@@ -19,9 +19,15 @@ import type { ToolDefinition } from "./types";
 const registry = new Map<string, ToolDefinition<any>>();
 
 export function registerTool(tool: ToolDefinition<any>): void {
-  if (tool.permissionLevel === "EXTERNAL_ACTION" && (!tool.buildApprovalDraft || !tool.execute)) {
+  if (tool.permissionLevel === "EXTERNAL_ACTION") {
+    if (!tool.approvalPayloadSchema || !tool.resolvePayload || !tool.describePayload || !tool.execute) {
+      throw new Error(
+        `Tool "${tool.id}" is EXTERNAL_ACTION but is missing one of approvalPayloadSchema/resolvePayload/describePayload/execute. Refusing to register.`
+      );
+    }
+  } else if (!tool.run) {
     throw new Error(
-      `Tool "${tool.id}" is EXTERNAL_ACTION but is missing buildApprovalDraft/execute. Refusing to register.`
+      `Tool "${tool.id}" is ${tool.permissionLevel} but has no run(). Refusing to register.`
     );
   }
   registry.set(tool.id, tool);

@@ -25,7 +25,11 @@ const checkConnectionTool: ToolDefinition<Record<string, never>> = {
 };
 
 const searchEmailInput = z.object({
-  query: z.string().describe("Search terms, e.g. sender name, subject keywords, or a date range in plain English."),
+  query: z
+    .string()
+    .min(1)
+    .max(300)
+    .describe("Search terms, e.g. sender name, subject keywords, or a date range in plain English."),
 });
 
 const searchEmailTool: ToolDefinition<z.infer<typeof searchEmailInput>> = {
@@ -86,8 +90,16 @@ const summarizeInboxTool: ToolDefinition<Record<string, never>> = {
 };
 
 const draftReplyInput = z.object({
-  originalEmail: z.string().describe("The full text of the email being replied to, pasted in by the user."),
-  instructions: z.string().optional().describe("Any guidance on tone, points to make, or how to respond."),
+  originalEmail: z
+    .string()
+    .min(1)
+    .max(20_000)
+    .describe("The full text of the email being replied to, pasted in by the user."),
+  instructions: z
+    .string()
+    .max(2_000)
+    .optional()
+    .describe("Any guidance on tone, points to make, or how to respond."),
 });
 
 const draftReplyTool: ToolDefinition<z.infer<typeof draftReplyInput>> = {
@@ -109,38 +121,48 @@ const draftReplyTool: ToolDefinition<z.infer<typeof draftReplyInput>> = {
   },
 };
 
-const sendEmailInput = z.object({
-  to: z.string().describe("Recipient email address."),
-  subject: z.string().describe("Email subject line."),
-  body: z.string().describe("Email body text."),
+// The initial tool-call arguments (what the AI passes when it decides to
+// send an email) happen to have the exact same shape as the executable
+// payload for this tool, so one schema serves both roles.
+const sendEmailPayload = z.object({
+  to: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .email()
+    .max(320) // RFC 5321 maximum mailbox length
+    .describe("Recipient email address."),
+  subject: z.string().trim().min(1).max(500).describe("Email subject line."),
+  body: z.string().min(1).max(20_000).describe("Email body text."),
 });
 
-const sendEmailTool: ToolDefinition<z.infer<typeof sendEmailInput>> = {
+const sendEmailTool: ToolDefinition<z.infer<typeof sendEmailPayload>> = {
   id: "email.send",
   name: "Send Email",
   description:
     "Sends an email. This is an external, irreversible action and always requires explicit user approval before anything is sent.",
   category: "email",
   permissionLevel: "EXTERNAL_ACTION",
-  inputSchema: sendEmailInput,
-  run: async () => {
-    throw new Error("email.send has no direct run(); it must go through the approval flow.");
-  },
-  buildApprovalDraft: async (input) => ({
+  inputSchema: sendEmailPayload,
+  payloadHint: "Fields: to, subject, body",
+  approvalPayloadSchema: sendEmailPayload,
+  resolvePayload: async (input) => input,
+  describePayload: async (payload) => ({
     action: "Send email",
-    target: input.to,
-    content: `Subject: ${input.subject}\n\n${input.body}`,
-    consequence: `This will send an email to ${input.to} that they will receive immediately. This cannot be undone.`,
+    target: payload.to,
+    content: `Subject: ${payload.subject}\n\n${payload.body}`,
+    consequence: `This will send an email to ${payload.to} that they will receive immediately. This cannot be undone.`,
   }),
-  execute: async (input, ctx) => {
+  execute: async (payload, ctx) => {
     const connected = isConnected(ctx.userId, "gmail") || isConnected(ctx.userId, "outlook");
     if (!connected) {
       throw new Error(
         "No email account is connected. Connect one from Settings → Connected Services, then approve this action again."
       );
     }
-    // A real provider integration would call the send API here. None is
-    // wired up in this build, so we deliberately fail rather than pretend.
+    // A real provider integration would call the send API here, using
+    // payload.to/subject/body exactly as approved. None is wired up in
+    // this build, so we deliberately fail rather than pretend.
     throw new Error(
       "An email provider is marked connected, but no send integration is implemented yet in this build."
     );
