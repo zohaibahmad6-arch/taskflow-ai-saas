@@ -26,7 +26,11 @@ function withSecurityHeaders(res: NextResponse): NextResponse {
   res.headers.set("X-Content-Type-Options", "nosniff");
   res.headers.set("X-Frame-Options", "DENY");
   res.headers.set("Referrer-Policy", "same-origin");
-  res.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  // Microphone is deliberately allowed for this origin only (the voice
+  // command feature — see src/components/VoiceAssistant.tsx); camera and
+  // geolocation remain fully denied, and no third-party origin is ever
+  // granted microphone access.
+  res.headers.set("Permissions-Policy", "camera=(), microphone=(self), geolocation=()");
   // 'unsafe-eval' is only added outside production: React's dev mode uses
   // eval() for debugging features (better stack traces), but never in a
   // production build, so the stricter policy is safe to keep there.

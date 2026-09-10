@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { apiFetch } from "@/lib/csrfClient";
+import { VoiceAssistant } from "@/components/VoiceAssistant";
 
 type Message = { role: "user" | "assistant"; content: string };
 
@@ -21,6 +22,7 @@ export function ChatPanel({ initialPrompt }: { initialPrompt?: string }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [voiceOpen, setVoiceOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentInitialRef = useRef(false);
 
@@ -76,13 +78,24 @@ export function ChatPanel({ initialPrompt }: { initialPrompt?: string }) {
     void send(input);
   }
 
+  function handleVoiceExchange(exchange: { role: "user" | "assistant"; content: string }[]) {
+    setMessages((prev) => [...prev, ...exchange]);
+  }
+
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
+      {voiceOpen && (
+        <VoiceAssistant
+          conversationId={conversationId}
+          onExchange={handleVoiceExchange}
+          onClose={() => setVoiceOpen(false)}
+        />
+      )}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
         {messages.length === 0 && !loading && (
           <div className="mt-10 text-center text-sm text-muted">
             <p>This is your personal agent.</p>
-            <p className="mt-1">Try: &quot;Summarize my emails&quot; or &quot;Create today&apos;s LinkedIn post&quot;.</p>
+            <p className="mt-1">Try: &quot;Summarize my emails&quot; or &quot;Create today&apos;s LinkedIn post&quot;, or tap 🎙 to speak.</p>
           </div>
         )}
         <div className="mx-auto max-w-md space-y-3">
@@ -132,6 +145,15 @@ export function ChatPanel({ initialPrompt }: { initialPrompt?: string }) {
             placeholder="Message your agent…"
             className="max-h-32 min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-[15px] text-foreground outline-none placeholder:text-muted"
           />
+          <button
+            type="button"
+            onClick={() => setVoiceOpen(true)}
+            disabled={loading}
+            aria-label="Speak"
+            className="shrink-0 rounded-xl border border-border px-3.5 py-2.5 text-lg disabled:opacity-40"
+          >
+            🎙
+          </button>
           <button
             type="submit"
             disabled={loading || !input.trim()}

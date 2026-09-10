@@ -72,6 +72,11 @@ branding, or infrastructure with any other app.
   only prepares text, it never sends anything on its own (Outlook's
   `outlook.sendReply`/`outlook.forwardMessage` can turn a real draft into
   a real send, but only after approval).
+- **Voice control** — tap 🎙 on the AI Chat tab, speak a command, and it's
+  transcribed and run through the exact same authenticated agent/tool
+  pipeline as typed chat. See "Voice" below for the full architecture,
+  including why "yes" is treated as security-critical and how it's kept
+  from ever approving the wrong thing.
 - **LinkedIn job search & application assistant** — see the dedicated
   "LinkedIn Jobs" section below for the full picture, including WHY there's
   no live search or automated submission (LinkedIn provides no legitimate
@@ -213,6 +218,141 @@ a claim).
 - No batch "prepare and approve N applications at once" — every submission
   approval is for exactly one application, individually reviewed.
 
+## Voice
+
+### Architecture
+
+```
+iPhone microphone (explicit tap, never always-listening)
+  ↓ MediaRecorder captures a short clip
+POST /api/voice/transcribe (authenticated, rate-limited)
+  ↓ OpenAI Whisper — audio never touches disk, never logged
+Transcribed text shown for review
+  ↓ user taps Send
+POST /api/voice/command (authenticated, rate-limited, CSRF-protected)
+  ↓ src/lib/voice/command.ts: handleVoiceCommand()
+  ├─ a short confirm/deny utterance ("yes"/"approve"/"no"/"cancel")
+  │    → resolves EXACTLY ONE pending approval (never guesses) →
+  │      decideApproval() — the same, unmodified Approval Center
+  └─ anything else
+       → runChatTurn() — the EXACT SAME function typed chat calls,
+         which calls invokeTool() — the EXACT SAME tool registry,
+         READ_ONLY/PREPARATION/EXTERNAL_ACTION classification, and
+         Approval Center as every other entry point in this app
+  ↓
+Text response, with an optional "🔊 Speak response" using the
+browser's own text-to-speech (output only — see below)
+```
+
+There is no separate voice agent, no separate tool-calling loop, and no
+`voice → tool execution` path that bypasses any of the above — verified
+both by code inspection (voice code contains zero direct calls to a
+tool's `execute()`) and by tests that invoke real Outlook and Jobs
+`EXTERNAL_ACTION` tools through the voice path and confirm they still
+only ever produce a pending approval.
+
+### Why "yes" gets special handling
+
+A bare "yes"/"approve"/"no"/"cancel" is too security-sensitive to hand to
+the model's own judgment of what it might mean, so it's intercepted by a
+small, deliberately narrow, deterministic matcher
+(`src/lib/voice/confirmation.ts`) — not a general command parser, and not
+an AI classifier. It only matches short (≤4 word) utterances that are
+*entirely* a confirm/deny phrase; a longer sentence that happens to
+contain the word "yes" (e.g. "yes, I have 10 years of experience") is
+correctly left alone and goes to chat as a real answer, not a decision.
+
+Matching this pattern only decides *which already-secure code path* an
+utterance is routed to — it is never itself the security boundary. Once
+routed to the confirm/deny path, `handleVoiceCommand()`:
+
+1. If the client hints at a specific approval it just displayed
+   (`trackedApprovalId`), that hint is independently re-verified fresh —
+   ownership, pending status, everything — against the database; a stale,
+   wrong-user, or already-decided hint is silently discarded, never
+   trusted.
+2. Otherwise (or if the hint didn't hold up), it looks at *all* of the
+   user's actually-pending approvals: zero means "nothing to approve",
+   exactly one is unambiguous, and **more than one always asks which one
+   — a generic "yes" can never approve multiple actions**.
+3. The revision passed to `decideApproval()` is always read fresh from the
+   database inside this same call — never supplied by the client — so an
+   edit made between when the approval was last shown and when "yes" was
+   said is still safely caught.
+
+### Speech-to-text
+
+iOS Safari has **never supported** the browser's Web Speech *Recognition*
+API (`SpeechRecognition`/`webkitSpeechRecognition`) — only Chrome/Android
+do. So voice input here uses `MediaRecorder` + `getUserMedia` instead
+(supported in iOS Safari 14.3+) to capture a short clip client-side, and a
+server-side endpoint (`/api/voice/transcribe`) sends it to OpenAI's
+Whisper API using the existing, server-only `OPENAI_API_KEY` — the key
+never reaches the browser, is never a `NEXT_PUBLIC_*` variable, and never
+appears in the built client bundle (verified live — see below).
+
+### Privacy / data retention
+
+- Raw audio exists only as an in-memory `Buffer` for the duration of one
+  transcription request — it is never written to disk (no temp file, so
+  nothing to clean up), never logged, and never appears in the audit log.
+- The audit log records only content-free metadata ("a voice command was
+  transcribed", "a voice command was received") — never the spoken text
+  or the audio itself. If the command goes on to call a tool, that tool's
+  own existing audit/redaction rules apply exactly as they do for typed
+  commands.
+- The transcript text is not persisted by the transcription endpoint
+  itself; it's only saved to conversation history if it's actually sent
+  as a chat message — same as a typed message always has been.
+
+### Text-to-speech
+
+Optional, output-only, via the browser's native `speechSynthesis` API
+(well-supported in iOS Safari, unlike speech *recognition*). There is no
+server round-trip and no callback wiring: `src/lib/voice/tts.ts` has
+exactly one capability — read text aloud — and cannot invoke a tool,
+approve anything, or reach the network even in principle, since it never
+receives or produces anything other than the act of speaking. There is no
+`TTS → command parser → tool` path anywhere in this codebase.
+
+### Mobile UI
+
+`src/components/VoiceAssistant.tsx`, opened via a 🎙 button next to the
+existing chat input on the AI Chat tab, targeting 390×844/393×852:
+**Ready** ("How can I help? 🎙 Speak / ⌨ Type instead") → **Listening**
+(animated, Cancel) → **Processing** ("Understanding…") → **Transcribed**
+(shows the recognized text, Send / Try Again / Cancel) → **Response**
+(the assistant's answer, optional 🔊, 🎙 to continue or Done) — with a
+dedicated **Error** state (never a crash) for permission-denied,
+unsupported-browser, no-microphone, empty transcription, and network
+failures, each with a clear, mobile-friendly message and a Try Again.
+
+### No always-listening
+
+There is no wake word, no continuous recording, and no background
+microphone access anywhere in this codebase — the microphone is only ever
+active between an explicit tap on 🎙/Stop and the recording actually
+stopping (which also happens automatically after a 30-second safety
+timer). `Permissions-Policy: microphone=(self)` (same-origin only, never
+a third party) replaces the previous fully-denied `microphone=()` — the
+one deliberate, minimal relaxation this feature required; camera and
+geolocation remain fully denied.
+
+### Known limitations
+
+- No live microphone/audio hardware exists in the environment this was
+  built in, so no real end-to-end "speak into an actual iPhone
+  microphone" test occurred — see "Real vs. mocked" below.
+- Whisper transcription quality for accents, background noise, or unusual
+  vocabulary (e.g. technical job titles) is unverified here — this
+  sandbox's network egress doesn't reach `api.openai.com` either, so no
+  real transcription call has succeeded in this environment at all.
+- The confirm/deny matcher is intentionally narrow (English, short
+  phrases). A longer or differently-phrased confirmation may not be
+  recognized as one and will instead go to the general chat/tool path,
+  which is the safe failure direction (it never accidentally decides an
+  approval it wasn't sure about).
+
 ## What is intentionally NOT faked
 
 Per the "no fake integrations" requirement, the following are architected
@@ -311,6 +451,18 @@ src/lib/candidateProfile.ts The verified CV/profile facts every jobs
                           matching/prep function is grounded against —
                           nothing in the jobs feature may invent beyond
                           what's stored here.
+src/lib/voice/            command.ts (handleVoiceCommand — the confirm/
+                          deny vs. chat routing decision, fully unit-
+                          tested independent of any HTTP layer) +
+                          confirmation.ts (the narrow yes/no matcher) +
+                          transcribe.ts (thin OpenAI Whisper wrapper) +
+                          tts.ts ("use client", output-only speech
+                          synthesis — see "Voice" above).
+src/hooks/useVoiceRecorder.ts MediaRecorder-based mic capture (NOT the
+                          Web Speech Recognition API, which iOS Safari
+                          has never supported).
+src/components/VoiceAssistant.tsx The voice UI state machine, opened from
+                          ChatPanel.
 src/proxy.ts             Auth gate, security headers, CSRF check for every
                           request (Next's "proxy", formerly "middleware").
 ```
@@ -447,9 +599,38 @@ nothing result.
 ## Verified before calling this done
 
 - `npm run build`, `npm run lint`, and `npm audit` all pass clean (0
-  vulnerabilities). `npm test` passes 183/183 (138 from before the
-  LinkedIn Jobs feature, plus 45 new tests covering extraction/
-  normalization, deterministic Easy Apply detection, matching levels
+  vulnerabilities). `npm test` passes 232/232 (183 from before the Voice
+  feature, plus 49 new tests covering the confirm/deny matcher,
+  `handleVoiceCommand`'s full approval-security matrix — exact match,
+  ambiguous/multiple pending, cross-user, already-decided, expired,
+  server-always-reads-revision-fresh — real Outlook and Jobs
+  `EXTERNAL_ACTION` tools invoked through the voice path to prove it's
+  really the same `invokeTool()` pipeline, transcription success/empty/
+  failure, and structural privacy/security scans (no disk writes, no
+  transcript in audit logs, no secrets in voice source, TTS import-graph
+  proof that it cannot reach a tool). One test file
+  (`voice-command-scope.test.ts`) that previously asserted "no voice code
+  exists" was deleted and replaced with this real coverage, exactly as
+  its own comment said to do once voice was actually built.
+- **A real bug was found and fixed during Playwright verification, not by
+  unit tests**: `useVoiceRecorder`'s permission-denied/no-microphone
+  classification was read from the hook's React state synchronously right
+  after an `await`, before the state update from inside the hook had
+  actually re-rendered the component — a stale-closure bug that always
+  fell back to the generic "unknown" error message instead of the correct
+  one. Fixed by having `start()` throw a typed error carrying the
+  classification directly, so the caller never depends on state timing.
+  Re-verified live after the fix — see below.
+- Playwright verified the full voice UI live against the running dev
+  server at 390×844 (mocked `getUserMedia`/`MediaRecorder`, since this
+  sandbox has no real microphone — see "Real vs. mocked" below): opened
+  the voice modal from AI Chat, walked Ready → Listening → Processing →
+  Transcribed → Response → Done, confirmed the exchange appeared in the
+  normal chat transcript afterward, and confirmed the permission-denied
+  error state shows the correct message. Zero console/hydration errors
+  throughout.
+- The LinkedIn Jobs test suite (183 tests as of the previous session)
+  covers extraction/normalization, deterministic Easy Apply detection, matching levels
   (including "empty profile never scores strong"), application prep,
   `jobs.submitApplication` approval gating (stale revision, expired,
   rejected, already-executed, duplicate-submission by status and by
@@ -522,6 +703,24 @@ nothing result.
   and the full capture→match→prepare→submit-approval pipeline with hostile
   injected content. No claim here should be read as "a real LinkedIn
   account was connected" — that is not a capability this build has.
+- **Voice — REAL vs. MOCKED, stated plainly**: this environment has no
+  microphone hardware and no real network egress to `api.openai.com`, so
+  **no real end-to-end voice interaction occurred** — no real audio was
+  captured from an actual microphone, and no real Whisper transcription
+  call has ever succeeded here. What's real: the full UI state machine,
+  exercised live via Playwright with `getUserMedia`/`MediaRecorder`
+  mocked at the browser API level (not the app's own code) to produce a
+  synthetic audio blob, with the `/api/voice/transcribe` and
+  `/api/voice/command` network calls intercepted to return canned
+  responses — this verified the UI/state transitions and surfaced the
+  real stale-closure bug described above, but is not evidence about
+  Whisper's transcription accuracy or about a real phone's microphone/
+  Safari behavior. What ran fully for real: `classifyConfirmation`'s text
+  matching, and `handleVoiceCommand`'s entire approval-security logic
+  (all in the unit suite, no mocking needed — it's pure server-side logic
+  with no external calls of its own). Do not read anything here as "voice
+  was tested on a real iPhone" — it was not, and could not be, in this
+  environment.
 - **Not verified**: actual OpenAI response quality/streaming under load —
   this sandbox's network egress doesn't reach `api.openai.com`, so the AI
   calls (including the new classification/organization-plan prompts) were
