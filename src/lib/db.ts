@@ -67,6 +67,10 @@ function openDatabase(): Database.Database {
 function runMigrations(db: Database.Database): void {
   const migrations = [
     "ALTER TABLE email_summaries ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail'",
+    "ALTER TABLE notifications ADD COLUMN category TEXT NOT NULL DEFAULT 'SYSTEM'",
+    "ALTER TABLE notifications ADD COLUMN reference_id TEXT",
+    "ALTER TABLE notifications ADD COLUMN read_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_user_reference ON notifications(user_id, reference_id)",
   ];
   for (const sql of migrations) {
     try {

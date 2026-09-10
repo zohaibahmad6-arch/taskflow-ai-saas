@@ -176,18 +176,33 @@ CREATE TABLE IF NOT EXISTS capability_requests (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- The Personal Notification Center. `type` is kept for backwards
+-- compatibility (existing rows/callers) but new code should read/write
+-- `category` — one of EMAIL | JOB | APPLICATION | APPROVAL | SYSTEM.
+-- `reference_id` is a stable identifier for the underlying event (e.g. an
+-- approval id) used to avoid re-notifying about the same unresolved thing
+-- (see notifyUser's dedup check in push.ts). Notifications are informational
+-- only: nothing reads this table to decide whether an action is authorized
+-- — see approvals.ts, which is the sole place decisions are made.
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'SYSTEM',
   title TEXT NOT NULL,
   body TEXT NOT NULL,
   link TEXT,
+  reference_id TEXT,
   read INTEGER NOT NULL DEFAULT 0,
+  read_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read, created_at DESC);
+-- idx_notifications_user_reference is created in db.ts's runMigrations(),
+-- not here: on a pre-existing database this file runs BEFORE the
+-- reference_id column migration below, so an index referencing that
+-- column here would fail on any database created before this feature.
 
 CREATE TABLE IF NOT EXISTS chat_messages (
   id TEXT PRIMARY KEY,
@@ -298,3 +313,30 @@ CREATE TABLE IF NOT EXISTS rate_limit_hits (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rate_limit_bucket ON rate_limit_hits(bucket_key, hit_at);
+
+-- The aggregated Daily Personal Briefing (email + jobs + approvals). Holds
+-- only counts and short reference-based item summaries (ids, subjects,
+-- snippets, reasons) already minimized by the underlying tables this is
+-- aggregated FROM (email_summaries, jobs, job_applications, approvals) —
+-- never full email bodies. UNIQUE(user_id, briefing_date) is what makes
+-- generation idempotent: a retry (or a future scheduler firing twice)
+-- upserts the same row instead of creating a duplicate — see
+-- src/lib/dailyBriefing.ts. `briefing_date` is the UTC calendar date
+-- (see that file for why: no per-user timezone preference exists yet).
+CREATE TABLE IF NOT EXISTS daily_briefings (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  briefing_date TEXT NOT NULL,
+  summary_text TEXT NOT NULL DEFAULT '',
+  urgent_count INTEGER NOT NULL DEFAULT 0,
+  actions_count INTEGER NOT NULL DEFAULT 0,
+  deadlines_count INTEGER NOT NULL DEFAULT 0,
+  approvals_count INTEGER NOT NULL DEFAULT 0,
+  jobs_count INTEGER NOT NULL DEFAULT 0,
+  data_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(user_id, briefing_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_briefings_user_date ON daily_briefings(user_id, briefing_date DESC);

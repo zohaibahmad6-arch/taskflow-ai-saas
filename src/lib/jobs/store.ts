@@ -207,6 +207,19 @@ export function listApplicationsForJob(userId: string, jobId: string): JobApplic
   return rows.map(rowToApplication);
 }
 
+/**
+ * Every application across every job for this user, most recently updated
+ * first — used by the daily briefing to aggregate "awaiting action" /
+ * "awaiting approval" applications without looping listJobs +
+ * listApplicationsForJob per job.
+ */
+export function listApplicationsForUser(userId: string, limit = 200): JobApplication[] {
+  const rows = db
+    .prepare("SELECT * FROM job_applications WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?")
+    .all(userId, limit) as JobApplicationRow[];
+  return rows.map(rowToApplication);
+}
+
 export function updateJobApplicationStatus(
   userId: string,
   id: string,

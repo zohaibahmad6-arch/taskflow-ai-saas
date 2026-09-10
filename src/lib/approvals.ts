@@ -83,6 +83,8 @@ export function createApproval(params: {
     title: "Action awaiting your approval",
     body: `${params.draftText.action} → ${params.draftText.target}`,
     url: "/approvals",
+    category: "APPROVAL",
+    referenceId: id,
   }).catch(() => {});
 
   return getApprovalById(id)!;
@@ -335,6 +337,8 @@ export async function executeApproval(
       title: "Action completed",
       body: `${row.action} → ${row.target} finished successfully.`,
       url: "/activity",
+      category: "APPROVAL",
+      referenceId: `${row.id}:executed`,
     }).catch(() => {});
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error during execution.";
@@ -355,6 +359,8 @@ export async function executeApproval(
       title: "Action failed",
       body: `${row.action} → ${row.target} could not be completed.`,
       url: "/activity",
+      category: "APPROVAL",
+      referenceId: `${row.id}:failed`,
     }).catch(() => {});
   }
 

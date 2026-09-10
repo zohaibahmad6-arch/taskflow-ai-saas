@@ -93,6 +93,14 @@ branding, or infrastructure with any other app.
 - **Push notifications** — real Web Push (VAPID), not a stub. Enable it from
   Settings → Notifications on an iPhone after adding the app to the Home
   Screen (Safari requirement for iOS web push).
+- **Daily Personal Briefing + Notification Center** — the Home tab is now a
+  "Your briefing" screen aggregating real email (per connected provider),
+  real saved jobs/applications, and real pending approvals into one honest
+  summary — never fabricating a section it has no data for. A new
+  Notifications screen (bell icon, top-right of the briefing) lists every
+  EMAIL/JOB/APPLICATION/APPROVAL/SYSTEM notification with read/unread state
+  and deep links. See "Daily Briefing + Notification Center" below for the
+  full architecture, including why there's no real scheduler yet.
 
 ## LinkedIn Jobs
 
@@ -352,6 +360,134 @@ geolocation remain fully denied.
   recognized as one and will instead go to the general chat/tool path,
   which is the safe failure direction (it never accidentally decides an
   approval it wasn't sure about).
+
+## Daily Briefing + Notification Center
+
+### Architecture
+
+```
+src/lib/dailyBriefing.ts — generateDailyBriefing(userId, { forceRefresh? })
+  ├─ email: for each connected provider (Gmail/Outlook), reuses the
+  │    EXISTING per-provider briefing (src/lib/email/briefing.ts) — the
+  │    same generateAndStoreBriefing() the "Summarize my inbox" tool has
+  │    always used. Disconnected → "Gmail is not connected." (never
+  │    fabricated).
+  ├─ jobs: reads listJobs()/listApplicationsForUser() (existing Jobs
+  │    tables) — strong matches (score ≥ 70), Easy Apply-verified jobs not
+  │    yet submitted, applications awaiting prep vs. awaiting approval
+  │    (cross-referenced against real pending Approval Center entries for
+  │    jobs.submitApplication, never a status field alone). No saved jobs
+  │    → "No saved jobs."
+  └─ approvals: listApprovals(userId, "pending") — the EXACT SAME query
+       the Approval Center itself uses.
+  ↓
+Upserted into `daily_briefings` (UNIQUE(user_id, briefing_date)) —
+idempotent: a retry or duplicate call the same UTC day reuses the stored
+briefing instead of recomputing/re-fetching, unless forceRefresh is set.
+  ↓
+Consumed identically by:
+  - GET /api/briefing (the Home/"Your briefing" screen)
+  - the briefing.getDailyBriefing READ_ONLY tool (chat AND voice — see
+    below; zero voice-specific code was needed)
+```
+
+Nothing here is a second briefing/notification system — it's an
+aggregation layer over the email briefing, Jobs, and Approval Center
+services that already existed, plus an extension of the push notification
+system that already existed (`src/lib/push.ts`'s `notifyUser`/
+`notifications` table, previously used only for approval push alerts).
+
+### Notification Center
+
+`notifications` gained `category` (`EMAIL | JOB | APPLICATION | APPROVAL |
+SYSTEM`), `reference_id`, and `read_at` columns (idempotent `ALTER TABLE`
+migrations — existing databases pick them up automatically, existing rows
+default to category `SYSTEM`). Every query (`listNotifications`,
+`getUnreadNotificationCount`, `markNotificationRead`) is scoped to the
+authenticated `userId` — there is no code path that can read or mark
+another user's notification.
+
+**Deduplication**: `notifyUser(userId, { category, referenceId, ... })`
+skips creating a new row (and skips sending push) if an *unread*
+notification with the same user/category/referenceId already exists — so
+a still-pending approval, or a briefing that hasn't changed, doesn't spam
+repeated notifications. Once the existing one is read, a new event with
+the same referenceId is allowed again.
+
+**Security (non-negotiable, unchanged from the original push design)**: a
+notification is output only.
+`Notification → Open app → Authenticated UI → User review → Approval if
+required → Action` — never `Notification → execute`. Concretely:
+- The mark-read API route (`/api/notifications/read`) can only flip a
+  `read`/`read_at` flag; it has no import of, or path to,
+  `decideApproval`/`invokeTool`/`executeApproval` (verified by a
+  structural test, not just code review).
+- A notification saying "Outlook has 5 emails ready to archive." is never
+  itself an approval — the underlying `EXTERNAL_ACTION` still requires the
+  user to open the Approval Center (or say "approve" while that exact
+  approval is tracked) and go through `decideApproval()`, completely
+  unmodified by this feature.
+- Push payloads stay minimal (title + short body only — e.g. "You have 2
+  important emails requiring attention.", never an email body or sender
+  content), same discipline the original push implementation already had.
+
+### Scheduling (honest status: no real scheduler)
+
+This codebase has no legitimate server-side cron/scheduler infrastructure
+(no host-level cron, no queue, no durable timer service) — running one
+in-process (e.g. `setInterval`) would silently stop working on every
+serverless cold start or restart, so **none was added**, and none is
+claimed. `generateDailyBriefing(userId)` is a plain, reusable,
+on-demand-callable async function — called today from the Home screen
+request, `/api/briefing`, and the briefing tool — with no
+scheduler-specific code anywhere in it (verified by a structural test).
+Wiring a real scheduler later (e.g. a hosting platform's cron trigger
+calling `/api/briefing` per user) requires zero changes to this function;
+its idempotency (`UNIQUE(user_id, briefing_date)`) and dedup-aware
+notifications were built specifically so that a future scheduler firing
+twice, or retrying after a failure, can never produce a duplicate briefing
+or a duplicate notification.
+
+**Timezone**: no per-user timezone preference exists anywhere in this
+app's schema yet, so `briefing_date` is the UTC calendar date — called out
+explicitly here rather than silently assumed. Because generation is
+on-demand (not scheduled), this mostly affects which UTC day a briefing
+generated right around midnight lands on; every count and item in it is
+still accurate at generation time regardless. Adding a real timezone
+preference later only needs to change how "today" is computed for a given
+user — everything downstream (storage, idempotency, dedup) already works
+off an opaque date string.
+
+### Voice + TTS integration
+
+One new READ_ONLY tool, `briefing.getDailyBriefing`, covers every required
+voice question ("Give me my daily briefing.", "What needs my attention?",
+"What emails are urgent?", "Do I have any job applications waiting?",
+"Are there any approvals waiting for me?") — the model reads its
+structured output and phrases whichever framing was asked. This reaches
+voice through the **exact same** `runChatTurn()`/`invokeTool()` path every
+other tool uses; no voice-specific code was written or needed (verified by
+tests that send all five phrasings through `handleVoiceCommand()`). Being
+READ_ONLY, it can never itself create or decide an approval — verified by
+the same voice test suite. TTS (`speechSynthesis`, already output-only —
+see "Voice" above) can read the briefing's concise `summaryText` aloud;
+the briefing never includes a full email body for it to accidentally
+speak (verified — no `bodyPreview`/`fullBody`/`htmlBody` field anywhere in
+its output).
+
+### Mobile UI
+
+- **Home ("Your briefing")** — greeting, a 🔴 urgent banner when
+  `urgentCount > 0`, four stat tiles (deadlines/actions/approvals/strong
+  job matches), a "Today's priorities" list, and honest per-provider email
+  status, alongside the pre-existing Jobs/Approvals/Social/Activity
+  sections. A bell icon (top-right) shows the live unread count and links
+  to Notifications.
+- **Notifications** — unread count, category filter chips, read/unread
+  visual state, relative timestamps, tap-to-open (marks read + follows the
+  notification's deep link). Both built and verified at 390×844 with
+  `safe-top`/`safe-bottom` spacing, matching every other screen in this
+  app.
 
 ## What is intentionally NOT faked
 
@@ -688,6 +824,46 @@ nothing result.
   connected, see real messages, approve a real move" flow needs to be run
   by you with real Azure app credentials; this build cannot and does not
   claim that happened.
+- **Daily Briefing + Notification Center (this session)**: `npm test`
+  passes 267/267 (232 from before this feature, plus 35 new — daily
+  briefing across every connection-state combination including urgent/
+  deadline detection with rehydrated-not-AI-trusted fields, jobs
+  aggregation, approvals aggregation, idempotency/upsert-not-duplicate,
+  user isolation; notification create/read/unread/mark-read/user-isolation/
+  dedup/reference-id/deep-link; a structural proof that the notification
+  API routes never import approval/execution machinery; and voice tests
+  sending all five required phrasings through the real
+  `handleVoiceCommand()`/`invokeTool()` path, confirming the briefing tool
+  is READ_ONLY and never creates an approval). `npm run lint`, `npx tsc
+  --noEmit`, `npm run build`, and `npm audit` all pass clean (0
+  vulnerabilities).
+- Live-verified with Playwright against the running dev server at
+  390×844: the "Your briefing" Home screen and the new Notifications
+  screen both render correctly for a fresh account with nothing connected
+  — `GET /api/briefing` returned honest "Gmail is not connected." /
+  "Outlook is not connected." / "No saved jobs." text, matching what the
+  UI displayed; seeded two real notification rows directly in the dev
+  database, confirmed the bell badge showed the correct unread count (2),
+  confirmed the categorized list rendered both (APPROVAL and JOB) with the
+  correct icon/timestamp, and confirmed tapping an unread notification
+  both navigated to its `link` (a real client-side route change, e.g.
+  `/jobs`) and marked it read in the same action.
+- **Not verified — real vs. mocked, stated plainly**: this session's
+  network egress does not reach `api.openai.com` either (confirmed live —
+  a direct test request was rejected with "Host not in allowlist"), so no
+  real AI email-categorization call was exercised end-to-end here; the
+  urgent/action-required/deadline detection test mocks `generateText`'s
+  return value the same way the pre-existing Gmail/Outlook tests do. No
+  real scheduled/cron execution was implemented or tested — see "Daily
+  Briefing + Notification Center" above for why, and don't take the
+  presence of tests named "scheduling" as a claim that real scheduled
+  execution exists; they test the reusable service interface and its
+  idempotency, which is what section 15 of this task asked for instead of
+  a fake scheduler. No push notification was verified delivered to a real
+  iPhone lock screen in this session — Web Push sending itself is
+  unchanged, pre-existing code (already covered by earlier sessions'
+  verification), and only the new `category`/`referenceId`/dedup logic
+  around it is new here.
 - Same as before for Gmail: no real end-to-end Gmail OAuth consent was
   performed in this sandbox either (no real Google Cloud OAuth client, and
   consent requires a human at a real browser).

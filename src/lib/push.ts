@@ -46,17 +46,59 @@ export function hasPushSubscription(userId: string): boolean {
 }
 
 /**
+ * The Personal Notification Center's category taxonomy. Every notification
+ * belongs to exactly one — used for filtering in the Notifications screen
+ * and, together with `referenceId`, for deduplication (see notifyUser).
+ */
+export type NotificationCategory = "EMAIL" | "JOB" | "APPLICATION" | "APPROVAL" | "SYSTEM";
+
+/**
  * Best-effort mobile notification. This is purely informational — it must
  * never be the trigger for an external action; it only tells the user
- * something needs their attention in the app.
+ * something needs their attention in the app. A notification click may
+ * open a screen for the user to review, but nothing here approves,
+ * executes, sends, deletes, moves, or submits anything.
+ *
+ * `referenceId`, when given, identifies the underlying unresolved event
+ * (e.g. an approval id, a job id). If an UNREAD notification with the same
+ * user, category, and referenceId already exists, this is a no-op — it
+ * neither inserts a new row nor sends another push. This is what stops a
+ * still-pending approval (or any other unresolved item) from generating a
+ * fresh notification every time something re-checks it.
  */
 export async function notifyUser(
   userId: string,
-  payload: { title: string; body: string; url?: string }
+  payload: {
+    title: string;
+    body: string;
+    url?: string;
+    category?: NotificationCategory;
+    referenceId?: string;
+  }
 ): Promise<void> {
+  const category = payload.category ?? "SYSTEM";
+
+  if (payload.referenceId) {
+    const existing = db
+      .prepare(
+        "SELECT 1 FROM notifications WHERE user_id = ? AND category = ? AND reference_id = ? AND read = 0 LIMIT 1"
+      )
+      .get(userId, category, payload.referenceId);
+    if (existing) return; // already notified about this exact unresolved item
+  }
+
   db.prepare(
-    "INSERT INTO notifications (id, user_id, type, title, body, link) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run(newId("notif"), userId, "push", payload.title, payload.body, payload.url ?? null);
+    "INSERT INTO notifications (id, user_id, type, category, title, body, link, reference_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    newId("notif"),
+    userId,
+    "push",
+    category,
+    payload.title,
+    payload.body,
+    payload.url ?? null,
+    payload.referenceId ?? null
+  );
 
   if (!ensureConfigured()) return;
 
@@ -83,22 +125,59 @@ export async function notifyUser(
   );
 }
 
+/** Marks every unread notification for this user as read. */
 export function markNotificationsRead(userId: string): void {
-  db.prepare("UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0").run(userId);
+  db.prepare(
+    "UPDATE notifications SET read = 1, read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ? AND read = 0"
+  ).run(userId);
+}
+
+/** Marks exactly one notification read — always scoped to the owning user. */
+export function markNotificationRead(userId: string, notificationId: string): void {
+  db.prepare(
+    "UPDATE notifications SET read = 1, read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND user_id = ? AND read = 0"
+  ).run(notificationId, userId);
+}
+
+export function getUnreadNotificationCount(userId: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read = 0")
+    .get(userId) as { n: number };
+  return row.n;
 }
 
 export type NotificationRow = {
   id: string;
   type: string;
+  category: NotificationCategory;
   title: string;
   body: string;
   link: string | null;
+  reference_id: string | null;
   read: number;
+  read_at: string | null;
   created_at: string;
 };
 
-export function listNotifications(userId: string, limit = 50): NotificationRow[] {
+/** Always scoped to the authenticated user — there is no cross-user query path here. */
+export function listNotifications(
+  userId: string,
+  opts?: { limit?: number; category?: NotificationCategory; unreadOnly?: boolean }
+): NotificationRow[] {
+  const limit = opts?.limit ?? 50;
+  const conditions = ["user_id = ?"];
+  const params: unknown[] = [userId];
+  if (opts?.category) {
+    conditions.push("category = ?");
+    params.push(opts.category);
+  }
+  if (opts?.unreadOnly) {
+    conditions.push("read = 0");
+  }
+  params.push(limit);
   return db
-    .prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ?")
-    .all(userId, limit) as NotificationRow[];
+    .prepare(
+      `SELECT * FROM notifications WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ?`
+    )
+    .all(...params) as NotificationRow[];
 }
